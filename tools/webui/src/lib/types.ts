@@ -75,6 +75,9 @@ export interface Song {
 	duration: number;
 	request: AceRequest;
 	audio: Blob;
+	// user-marked favorite, persisted across reloads. Acts as a sticky
+	// flag for the bulk "Delete non-favorites" action.
+	favorite?: boolean;
 	// raw f32 [T*64] post-DiT latents that the VAE decoder produces this
 	// audio from. Always present for songs from /synth or /vae decode (the
 	// server emits them unconditionally). Absent only for songs imported
