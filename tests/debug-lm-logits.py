@@ -138,7 +138,7 @@ def test_pytorch_logits(model_dir, prompt_tokens):
 def main():
     if len(sys.argv) < 4:
         print("Usage: debug-lm-logits.py <model_dir> <ggml_logits.bin> <tokens.csv>")
-        print("  1) ace-lm --dump-logits logits.bin --dump-tokens tokens.csv ...")
+        print("  1) ace-lm --models <dir> --request req.json --dump-logits logits.bin --dump-tokens tokens.csv")
         print("  2) python3 tests/debug-lm-logits.py checkpoints/acestep-5Hz-lm-0.6B logits.bin tokens.csv")
         return
 

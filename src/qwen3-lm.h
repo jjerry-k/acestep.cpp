@@ -165,7 +165,7 @@ static void qw3lm_init_backend(Qwen3LM * m) {
     m->backend        = bp.backend;
     m->cpu_backend    = bp.cpu_backend;
     m->sched          = backend_sched_new(bp, 8192);
-    m->use_flash_attn = true;
+    m->use_flash_attn = bp.has_gpu;
     m->clamp_fp16     = false;
 }
 

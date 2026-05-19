@@ -15,6 +15,7 @@
 struct BackendPair {
     ggml_backend_t backend;
     ggml_backend_t cpu_backend;
+    bool           has_gpu;
 };
 
 // Cached backend state (shared across all modules in the same binary)
@@ -105,6 +106,7 @@ static BackendPair backend_init(const char * label) {
         fprintf(stderr, "[Load] FATAL: failed to init CPU backend\n");
         exit(1);
     }
+    bp.has_gpu = !best_is_cpu;
     fprintf(stderr, "[Load] %s backend: %s (CPU threads: %d)\n", label, ggml_backend_name(bp.backend), n_threads);
 
     g_backend_cache = bp;

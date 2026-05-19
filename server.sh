@@ -10,5 +10,5 @@ set -eu
     --host 0.0.0.0 \
     --port 8085 \
     --models ./models \
-    --loras ./loras \
+    --adapters ./adapters \
     --max-batch 1

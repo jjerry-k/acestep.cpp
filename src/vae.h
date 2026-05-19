@@ -259,13 +259,20 @@ static void vae_ggml_load(VAEGGML * m, const char * path) {
 }
 
 // Graph building
-// Snake activation (fused): y = x + sin^2(a * x) * inv_b
+// Snake activation (5-op naive decomposition for backend pattern fusion)
+// y = x + sin(a * x)^2 * inv_b
 // x: [T, C], exp_a: [1, C], inv_b: [1, C] (pre-computed at load)
+// Backends pattern-match (mul -> sin -> sqr -> mul -> add) and dispatch
+// to their fused snake kernel under the hood.
 static struct ggml_tensor * vae_snake(struct ggml_context * ctx,
                                       struct ggml_tensor *  x,
                                       struct ggml_tensor *  exp_a,
                                       struct ggml_tensor *  inv_b) {
-    return ggml_snake(ctx, x, exp_a, inv_b);
+    struct ggml_tensor * ax = ggml_mul(ctx, x, exp_a);
+    struct ggml_tensor * s  = ggml_sin(ctx, ax);
+    struct ggml_tensor * s2 = ggml_sqr(ctx, s);
+    struct ggml_tensor * d  = ggml_mul(ctx, s2, inv_b);
+    return ggml_add(ctx, x, d);
 }
 
 // Conv1d + bias: data [T, IC] -> [T_out, OC]
@@ -377,8 +384,13 @@ static int vae_ggml_compute(VAEGGML *     m,
         }
 
         // Graph context (generous fixed allocation)
-        size_t ctx_size             = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false);
-        m->graph_buf                = (uint8_t *) malloc(ctx_size);
+        size_t ctx_size = ggml_tensor_overhead() * 1024 + ggml_graph_overhead_custom(8192, false);
+        m->graph_buf    = (uint8_t *) malloc(ctx_size);
+        if (!m->graph_buf) {
+            fprintf(stderr, "[VAE] FATAL: OOM allocating graph context (%zu bytes) for T=%d\n", ctx_size, T_latent);
+            m->graph_T = 0;
+            return -1;
+        }
         struct ggml_init_params p   = { ctx_size, m->graph_buf, true };
         struct ggml_context *   ctx = ggml_init(p);
 

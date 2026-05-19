@@ -109,34 +109,43 @@ def codes_to_python_format(codes_csv):
 
 # GGML runner
 
-def run_ggml(dump_dir, req, cfg, gguf_path, lora_dir=None):
+def run_ggml(dump_dir, req, cfg, gguf_path, adapter_dir=None):
     ggml_bin = "../build/ace-synth"
     if not os.path.isfile(ggml_bin):
         print(f"[GGML] binary not found: {ggml_bin}")
         return False
     os.makedirs(dump_dir, exist_ok=True)
 
-    # Build request from input, override mode-specific params
+    # Build request from input, override mode-specific params.
+    # Model selection travels inside the JSON: synth_model is the GGUF filename,
+    # adapter (if any) is the adapter file or PEFT directory name under its parent.
     merged = dict(req)
     merged["seed"] = SEED
     merged["inference_steps"] = cfg["steps"]
     merged["guidance_scale"] = cfg["guidance"]
     merged["shift"] = cfg["shift"]
     merged["thinking"] = False
+    merged["synth_model"] = os.path.basename(gguf_path)
+    merged["vae"] = "vae-BF16.gguf"
+
+    adapters_root = None
+    if adapter_dir:
+        adapters_root = os.path.dirname(os.path.abspath(adapter_dir)) or "."
+        merged["adapter"] = os.path.basename(os.path.normpath(adapter_dir))
+
     request_json = os.path.join(dump_dir, "request0.json")
     with open(request_json, "w") as f:
         json.dump(merged, f, indent=4)
 
-    cmd = [
-        ggml_bin,
-        "--dit", gguf_path,
-        "--embedding", "../models/Qwen3-Embedding-0.6B-BF16.gguf",
-        "--vae", "../models/vae-BF16.gguf",
+    models_dir = os.path.dirname(os.path.abspath(gguf_path)) or "../models"
+    cmd = [ggml_bin, "--models", models_dir]
+    if adapters_root:
+        cmd += ["--adapters", adapters_root]
+    cmd += [
         "--request", request_json,
         "--dump", dump_dir,
+        "--no-fa",
     ]
-    if lora_dir:
-        cmd += ["--lora", lora_dir]
     print(f"[GGML] Running {os.path.basename(gguf_path)}...")
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
     n = len([f for f in os.listdir(dump_dir) if f.endswith(".bin")])
@@ -153,7 +162,7 @@ def run_ggml(dump_dir, req, cfg, gguf_path, lora_dir=None):
 
 # Python runner
 
-def run_python(dump_dir, req, cfg, lora_dir=None):
+def run_python(dump_dir, req, cfg, adapter_dir=None):
     sys.path.insert(0, "../../ACE-Step-1.5")
     from acestep.handler import AceStepHandler
 
@@ -174,8 +183,12 @@ def run_python(dump_dir, req, cfg, lora_dir=None):
         device="cuda",
     )
 
-    if lora_dir:
-        lr = handler.add_lora(lora_dir)
+    if adapter_dir:
+        # torch.nn forbids '.' in module names, PEFT derives the adapter name
+        # from the directory basename. Sanitize so directory names like
+        # 'ACE-Step-v1.5-chinese-new-year-LoRA' do not abort Python ref load.
+        adapter_name = os.path.basename(os.path.normpath(adapter_dir)).replace(".", "_") or "default"
+        lr = handler.add_lora(adapter_dir, adapter_name=adapter_name)
         print(f"[Python] LoRA: {lr}")
 
     model = handler.model
@@ -441,7 +454,7 @@ def compare(dirs, stages, tag):
 
 # main
 
-def run_mode(mode_name, cfg, req, gguf_path, lora_dir=None):
+def run_mode(mode_name, cfg, req, gguf_path, adapter_dir=None):
     dump_ggml   = f"ggml-{mode_name}"
     dump_python = f"python-{mode_name}"
 
@@ -453,13 +466,13 @@ def run_mode(mode_name, cfg, req, gguf_path, lora_dir=None):
 
     if os.path.isdir(dump_ggml):
         shutil.rmtree(dump_ggml)
-    if not run_ggml(dump_ggml, req, cfg, gguf_path, lora_dir):
+    if not run_ggml(dump_ggml, req, cfg, gguf_path, adapter_dir):
         print(f"[{tag}] GGML failed")
         return False
 
     if os.path.isdir(dump_python):
         shutil.rmtree(dump_python)
-    if not run_python(dump_python, req, cfg, lora_dir):
+    if not run_python(dump_python, req, cfg, adapter_dir):
         print(f"[{tag}] Python failed")
         return False
 
@@ -473,8 +486,8 @@ def main():
                     help="which model to test (default: turbo)")
     ap.add_argument("--quant", default="BF16",
                     help="quantization suffix for GGUF (default: BF16, e.g. Q6_K, Q8_0)")
-    ap.add_argument("--lora", default=None,
-                    help="path to LoRA adapter directory (optional)")
+    ap.add_argument("--adapters", default=None,
+                    help="path to adapter directory (optional)")
     args = ap.parse_args()
 
     req = load_request()
@@ -488,7 +501,7 @@ def main():
             print(f"[Error] GGUF not found: {gguf_path}")
             ok = False
             continue
-        if not run_mode(m, cfg, req, gguf_path, args.lora):
+        if not run_mode(m, cfg, req, gguf_path, args.adapters):
             ok = False
 
     return 0 if ok else 1

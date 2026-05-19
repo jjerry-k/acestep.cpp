@@ -211,9 +211,21 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
 
     // 7) Attention (flash on GPU, F32 manual on CPU)
     //    Q[D, S, Nh, N], K[D, S, Nkv, N], V[D, S, Nkv, N]
-    float                scale = 1.0f / sqrtf((float) D);
-    struct ggml_tensor * attn  = m->use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
-                                                     dit_attn_f32(ctx, q, k, v, mask, scale);
+    float scale = 1.0f / sqrtf((float) D);
+
+    // K/V come in F32 from mul_mat (no KV cache here). Cast to F16 before FA,
+    // mirroring llama.cpp build_attn_mha for graphs without a KV cache.
+    if (m->use_flash_attn) {
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+        }
+    }
+
+    struct ggml_tensor * attn = m->use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
+                                                    dit_attn_f32(ctx, q, k, v, mask, scale);
     if (m->use_flash_attn) {
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     }
@@ -320,9 +332,21 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
 
     // no RoPE for cross-attention
     // mask blocks padding positions in encoder hidden states
-    float                scale = 1.0f / sqrtf((float) D);
-    struct ggml_tensor * attn  = m->use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
-                                                     dit_attn_f32(ctx, q, k, v, mask, scale);
+    float scale = 1.0f / sqrtf((float) D);
+
+    // K/V come in F32 from mul_mat (no KV cache here). Cast to F16 before FA,
+    // mirroring llama.cpp build_attn_mha for graphs without a KV cache.
+    if (m->use_flash_attn) {
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+        }
+    }
+
+    struct ggml_tensor * attn = m->use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
+                                                    dit_attn_f32(ctx, q, k, v, mask, scale);
     if (m->use_flash_attn) {
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     }

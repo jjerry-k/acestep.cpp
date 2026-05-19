@@ -15,9 +15,8 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(SCRIPT_DIR)
 GGML_BIN    = os.path.join(ROOT, "build", "ace-synth")
-DIT_GGUF    = os.path.join(ROOT, "models", "acestep-v15-sft-BF16.gguf")
-QWEN_GGUF   = os.path.join(ROOT, "models", "Qwen3-Embedding-0.6B-BF16.gguf")
-VAE_GGUF    = os.path.join(ROOT, "models", "vae-BF16.gguf")
+MODELS_DIR  = os.path.join(ROOT, "models")
+DIT_MODEL   = "acestep-v15-sft-BF16.gguf"
 
 FSQ_LEVELS = [8, 8, 8, 5, 5, 5]
 
@@ -60,14 +59,10 @@ def run_ggml(request_path, dump_dir):
     if not os.path.isfile(GGML_BIN):
         print(f"[GGML] binary not found: {GGML_BIN}")
         return False
-    if os.path.isdir(dump_dir):
-        shutil.rmtree(dump_dir)
-    os.makedirs(dump_dir)
+
     cmd = [
         GGML_BIN,
-        "--dit", DIT_GGUF,
-        "--embedding", QWEN_GGUF,
-        "--vae", VAE_GGUF,
+        "--models", MODELS_DIR,
         "--request", request_path,
         "--dump", dump_dir,
     ]
@@ -88,8 +83,7 @@ def main():
         print("[Error] request0.json not found in CWD")
         return 1
 
-    request_path = "request0.json"
-    req = json.load(open(request_path))
+    req = json.load(open("request0.json"))
     if 'audio_codes' not in req or not req['audio_codes']:
         print("ERROR: request has no audio_codes (run ace-lm first)")
         return 1
@@ -98,8 +92,19 @@ def main():
     T_5Hz = len(codes)
     print(f"[Input] {T_5Hz} codes, first 5: {codes[:5]}")
 
-    # Step 1: Run GGML
+    # Define the test request. Inherit the prompt and metadata from the
+    # ace-lm output, force the SFT DiT through synth_model.
+    req["synth_model"] = DIT_MODEL
+    req["vae"] = "vae-BF16.gguf"
     dump_dir = os.path.join(SCRIPT_DIR, "detok-dump")
+    if os.path.isdir(dump_dir):
+        shutil.rmtree(dump_dir)
+    os.makedirs(dump_dir)
+    request_path = os.path.join(dump_dir, "request.json")
+    with open(request_path, "w") as f:
+        json.dump(req, f, indent=4)
+
+    # Step 1: Run GGML
     if not run_ggml(request_path, dump_dir):
         return 1
 

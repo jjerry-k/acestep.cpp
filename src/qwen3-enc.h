@@ -179,9 +179,21 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
     // 6) Attention (flash or F32 manual fallback)
-    float                scale = 1.0f / sqrtf((float) D);
-    struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
-                                                  qwen3_attn_f32(ctx, q, k, v, mask, scale);
+    float scale = 1.0f / sqrtf((float) D);
+
+    // K/V come in F32 from mul_mat (encoder, no KV cache). Cast to F16 before FA,
+    // mirroring llama.cpp build_attn_mha for graphs without a KV cache.
+    if (use_flash_attn) {
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+        }
+    }
+
+    struct ggml_tensor * attn = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
+                                                 qwen3_attn_f32(ctx, q, k, v, mask, scale);
     if (use_flash_attn) {
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     }
@@ -302,18 +314,16 @@ static void qwen3_load_layer(WeightCtx *         wctx,
     ly->down_proj = gf_load_tensor(wctx, gf, prefix + ".mlp.down_proj.weight");
 }
 
-// Backend init
-static void qwen3_init_backend(Qwen3GGML * m) {
+// Load standalone text encoder (Qwen3-Embedding) from GGUF
+// gguf_path: path to the .gguf file
+static bool qwen3_load_text_encoder(Qwen3GGML * m, const char * gguf_path) {
+    // Backend init
     BackendPair bp    = backend_init("TextEncoder");
     m->backend        = bp.backend;
     m->cpu_backend    = bp.cpu_backend;
     m->sched          = backend_sched_new(bp, 4096);
-    m->use_flash_attn = true;
-}
+    m->use_flash_attn = bp.has_gpu;
 
-// Load standalone text encoder (Qwen3-Embedding) from GGUF
-// gguf_path: path to the .gguf file
-static bool qwen3_load_text_encoder(Qwen3GGML * m, const char * gguf_path) {
     m->cfg = {
         /*hidden_size*/ 1024,
         /*intermediate_size*/ 3072,

@@ -1,26 +1,26 @@
 // neural-codec.cpp: neural audio codec (Oobleck VAE)
 //
 // 2 modes:
-//   encode: WAV -> latent file (f32, Q8, or Q4)
+//   encode: WAV -> latent file (.vae, .nac8, or .nac4)
 //   decode: latent file -> WAV (48kHz stereo)
 //
 // Three latent formats, decode auto-detects:
 //
-//   f32 (default): flat [T, 64] f32, no header.
+//   .vae (default): flat [T, 64] f32, no header.
 //     T = file_size / 256. 25Hz, ~6.4 KB/s, ~51 kbit/s.
 //
-//   Q8 (--q8): symmetric per-frame int8 quantization.
+//   .nac8 (--q8): symmetric per-frame int8 quantization.
 //     header: "NAC8" magic (4B) + uint32 T_latent (4B)
 //     frame:  f16 scale (2B) + int8[64] (64B) = 66B
 //     25Hz, ~1.6 KB/s, ~13 kbit/s.
 //
-//   Q4 (--q4): symmetric per-frame 4-bit quantization.
+//   .nac4 (--q4): symmetric per-frame 4-bit quantization.
 //     header: "NAC4" magic (4B) + uint32 T_latent (4B)
 //     frame:  f16 scale (2B) + nibbles[32] (32B) = 34B
 //     25Hz, ~850 B/s, ~6.8 kbit/s.
 //
 // Usage:
-//   neural-codec --vae model.gguf --encode -i song.wav -o song.latent
+//   neural-codec --vae model.gguf --encode -i song.wav -o song.vae
 //   neural-codec --vae model.gguf --encode --q8 -i song.wav -o song.nac8
 //   neural-codec --vae model.gguf --encode --q4 -i song.wav -o song.nac4
 //   neural-codec --vae model.gguf --decode -i song.nac4 -o song.wav
@@ -194,6 +194,11 @@ static float * read_latent(const char * path, int * T_latent) {
         }
 
         float * data = (float *) malloc((size_t) t * 64 * sizeof(float));
+        if (!data) {
+            fprintf(stderr, "[Latent] OOM allocating Q8 decode buffer for %u frames\n", t);
+            fclose(f);
+            return NULL;
+        }
         for (int i = 0; i < (int) t; i++) {
             ggml_fp16_t scale_f16;
             if (fread(&scale_f16, 2, 1, f) != 1) {
@@ -241,6 +246,11 @@ static float * read_latent(const char * path, int * T_latent) {
         }
 
         float * data = (float *) malloc((size_t) t * 64 * sizeof(float));
+        if (!data) {
+            fprintf(stderr, "[Latent] OOM allocating Q4 decode buffer for %u frames\n", t);
+            fclose(f);
+            return NULL;
+        }
         for (int i = 0; i < (int) t; i++) {
             ggml_fp16_t scale_f16;
             if (fread(&scale_f16, 2, 1, f) != 1) {
@@ -291,6 +301,11 @@ static float * read_latent(const char * path, int * T_latent) {
 
     *T_latent    = (int) (fsize / (64 * sizeof(float)));
     float * data = (float *) malloc(fsize);
+    if (!data) {
+        fprintf(stderr, "[Latent] OOM allocating f32 decode buffer (%ld bytes)\n", fsize);
+        fclose(f);
+        return NULL;
+    }
     if (fread(data, 1, fsize, f) != (size_t) fsize) {
         fclose(f);
         free(data);
@@ -315,16 +330,17 @@ static void print_usage(const char * prog) {
             "Output:\n"
             "  -o <path>               Output file (auto-named if omitted)\n"
             "  --q8                    Quantize latent to int8 (~13 kbit/s)\n"
-            "  --q4                    Quantize latent to int4 (~6.8 kbit/s)\n\n"
-            "Output naming: song.wav -> song.latent (f32) or song.nac8 (Q8) or song.nac4 (Q4)\n"
-            "               song.latent -> song.wav\n\n"
+            "  --q4                    Quantize latent to int4 (~6.8 kbit/s)\n"
+            "  --format <fmt>          WAV format: wav16, wav24, wav32 (default: wav16)\n\n"
+            "Output naming: song.wav -> song.vae (f32) or song.nac8 (Q8) or song.nac4 (Q4)\n"
+            "               song.vae -> song.wav\n\n"
             "Memory control:\n"
-            "  --vae-chunk <N>         Latent frames per tile (default: 256)\n"
+            "  --vae-chunk <N>         Latent frames per tile (default: 1024)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n\n"
             "Latent formats (decode auto-detects):\n"
-            "  f32:  flat [T, 64] f32, no header. ~51 kbit/s.\n"
-            "  NAC8: header + per-frame Q8. ~13 kbit/s.\n"
-            "  NAC4: header + per-frame Q4. ~6.8 kbit/s.\n",
+            "  .vae:  flat [T, 64] f32, no header. ~51 kbit/s.\n"
+            "  .nac8: header + per-frame Q8. ~13 kbit/s.\n"
+            "  .nac4: header + per-frame Q4. ~6.8 kbit/s.\n",
             prog);
 }
 
@@ -341,10 +357,11 @@ int main(int argc, char ** argv) {
     const char * vae_path    = NULL;
     const char * input_path  = NULL;
     const char * output_path = NULL;
-    int          chunk_size  = 256;
+    int          chunk_size  = 1024;
     int          overlap     = 64;
     int          mode        = -1;  // 0 = encode, 1 = decode
     int          quant       = 0;   // 0 = f32, 8 = q8, 4 = q4
+    WavFormat    wav_fmt     = WAV_S16;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--vae") == 0 && i + 1 < argc) {
@@ -357,6 +374,13 @@ int main(int argc, char ** argv) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output_path = argv[++i];
+        } else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+            bool dummy_mp3;
+            if (!audio_parse_format(argv[++i], dummy_mp3, wav_fmt)) {
+                fprintf(stderr, "Unknown format: %s\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--vae-chunk") == 0 && i + 1 < argc) {
             chunk_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--vae-overlap") == 0 && i + 1 < argc) {
@@ -384,11 +408,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Auto output names
+    // Auto output names. f32 dumps land as .vae since they are the raw VAE
+    // encoder output with no codec applied; nac8/nac4 keep their codec name.
     std::string out_str;
     if (!output_path) {
         if (mode == 0) {
-            const char * ext = ".latent";
+            const char * ext = ".vae";
             if (quant == 8) {
                 ext = ".nac8";
             }
@@ -473,7 +498,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
 
-        if (audio_write(output_path, audio.data(), T_audio, 48000, 0)) {
+        if (audio_write(output_path, audio.data(), T_audio, 48000, 0, wav_fmt)) {
             fprintf(stderr, "\n[VAE] Output: %s (%d samples, %.2fs @ 48kHz)\n", output_path, T_audio,
                     (float) T_audio / 48000.0f);
         } else {

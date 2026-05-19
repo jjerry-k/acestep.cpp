@@ -66,11 +66,13 @@ struct DetokGGML {
 };
 
 // Load from DiT GGUF
-static bool detok_ggml_load(DetokGGML * m, const char * gguf_path, ggml_backend_t backend, ggml_backend_t cpu_backend) {
-    m->cfg            = detok_config();
-    m->backend        = backend;
-    m->cpu_backend    = cpu_backend;
-    m->use_flash_attn = true;
+static bool detok_ggml_load(DetokGGML * m, const char * gguf_path) {
+    m->cfg = detok_config();
+
+    BackendPair bp    = backend_init("Detokenizer");
+    m->backend        = bp.backend;
+    m->cpu_backend    = bp.cpu_backend;
+    m->use_flash_attn = bp.has_gpu;
 
     GGUFModel gf;
     if (!gf_load(&gf, gguf_path)) {
@@ -99,15 +101,14 @@ static bool detok_ggml_load(DetokGGML * m, const char * gguf_path, ggml_backend_
         qwen3_load_layer(&m->wctx, gf, &m->layers[i], prefix);
     }
 
-    if (!wctx_alloc(&m->wctx, backend)) {
+    if (!wctx_alloc(&m->wctx, m->backend)) {
         gf_close(&gf);
         return false;
     }
     gf_close(&gf);
 
     // Scheduler
-    BackendPair bp_detok = { backend, cpu_backend };
-    m->sched             = backend_sched_new(bp_detok, 4096);
+    m->sched = backend_sched_new(bp, 4096);
     if (!m->sched) {
         fprintf(stderr, "[FSQ] FATAL: failed to create scheduler\n");
         return false;
@@ -217,5 +218,6 @@ static void detok_ggml_free(DetokGGML * m) {
         ggml_backend_sched_free(m->sched);
     }
     wctx_free(&m->wctx);
+    backend_release(m->backend, m->cpu_backend);
     *m = {};
 }

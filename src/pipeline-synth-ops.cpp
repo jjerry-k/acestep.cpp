@@ -1,76 +1,159 @@
-// pipeline-synth.cpp: ACE-Step synthesis pipeline implementation
+// pipeline-synth-ops.cpp: primitive operations of the synthesis pipeline
 //
-// Wraps DiT + TextEncoder + CondEncoder + VAE for audio generation.
+// Each op takes AceSynth (the pipeline context) and SynthState (the transient
+// job state). See pipeline-synth-ops.h for the per-op contract and
+// pipeline-synth-impl.h for the struct layouts.
 
 #include "pipeline-synth-ops.h"
 
-#include "bpe.h"
-#include "cond-enc.h"
-#include "debug.h"
 #include "dit-sampler.h"
-#include "dit.h"
-#include "fsq-detok.h"
-#include "fsq-tok.h"
-#include "gguf-weights.h"
 #include "philox.h"
-#include "pipeline-synth.h"
-#include "qwen3-enc.h"
-#include "request.h"
-#include "timer.h"
+#include "pipeline-synth-impl.h"
+#include "task-types.h"
 #include "vae-enc.h"
-#include "vae.h"
 
-#include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <random>
 #include <string>
+#include <system_error>
 #include <vector>
 
-// static helpers
 static const int FRAMES_PER_SECOND = 25;
 
-static std::vector<int> parse_codes_string(const std::string & s) {
-    std::vector<int> codes;
-    if (s.empty()) {
-        return codes;
-    }
-    const char * p = s.c_str();
-    while (*p) {
-        while (*p == ',' || *p == ' ') {
-            p++;
-        }
-        if (!*p) {
-            break;
-        }
-        codes.push_back(atoi(p));
-        while (*p && *p != ',') {
-            p++;
-        }
-    }
-    return codes;
+// Locale immune scalar reader. std::from_chars handles ints on every stdlib
+// and floats on every stdlib except libc++ before v20 (AppleClang ships an
+// old libc++). There we hand roll a tiny C locale parser supporting decimal
+// and optional exponent. Returns ptr past consumed bytes, or first on parse
+// failure.
+static const char * scan_num(const char * first, const char * last, int & v) {
+    auto r = std::from_chars(first, last, v);
+    return r.ec == std::errc{} ? r.ptr : first;
 }
 
-#include "pipeline-synth-impl.h"
+static const char * scan_num(const char * first, const char * last, float & v) {
+#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION < 200000
+    const char * p   = first;
+    bool         neg = false;
+    if (p < last && (*p == '+' || *p == '-')) {
+        neg = (*p == '-');
+        p++;
+    }
+    double m   = 0.0;
+    bool   any = false;
+    while (p < last && *p >= '0' && *p <= '9') {
+        m   = m * 10.0 + (double) (*p - '0');
+        any = true;
+        p++;
+    }
+    if (p < last && *p == '.') {
+        p++;
+        double frac = 0.1;
+        while (p < last && *p >= '0' && *p <= '9') {
+            m += (double) (*p - '0') * frac;
+            frac *= 0.1;
+            any = true;
+            p++;
+        }
+    }
+    if (!any) {
+        return first;
+    }
+    if (p < last && (*p == 'e' || *p == 'E')) {
+        const char * eptr = p;
+        p++;
+        bool eneg = false;
+        if (p < last && (*p == '+' || *p == '-')) {
+            eneg = (*p == '-');
+            p++;
+        }
+        int  e    = 0;
+        bool eany = false;
+        while (p < last && *p >= '0' && *p <= '9') {
+            e    = e * 10 + (*p - '0');
+            eany = true;
+            p++;
+        }
+        if (!eany) {
+            p = eptr;
+        } else {
+            double scale = 1.0;
+            for (int i = 0; i < e; i++) {
+                scale *= 10.0;
+            }
+            m = eneg ? m / scale : m * scale;
+        }
+    }
+    v = (float) (neg ? -m : m);
+    return p;
+#else
+    auto r = std::from_chars(first, last, v);
+    return r.ec == std::errc{} ? r.ptr : first;
+#endif
+}
 
-// ops_encode_src
-int ops_encode_src(AceSynth * ctx, const float * src_audio, int src_len, SynthState & s) {
-    // Cover mode: load VAE encoder and encode source audio
+// CSV list parser tolerant to any whitespace around commas. Locale immune,
+// bails on first parse error and returns the values consumed so far. Used
+// for audio_codes (int) and custom_timesteps (float).
+template <typename T> static std::vector<T> parse_csv(const std::string & s) {
+    std::vector<T> out;
+    const char *   first = s.data();
+    const char *   last  = first + s.size();
+    while (first < last) {
+        while (first < last && (*first == ',' || *first == ' ')) {
+            first++;
+        }
+        if (first == last) {
+            break;
+        }
+        T            v{};
+        const char * next = scan_num(first, last, v);
+        if (next == first) {
+            break;
+        }
+        out.push_back(v);
+        first = next;
+    }
+    return out;
+}
+
+int ops_encode_src(const AceSynth * ctx,
+                   const float *    src_audio,
+                   int              src_len,
+                   const float *    src_latents,
+                   int              src_T_latent,
+                   SynthState &     s) {
+    // Cover mode: ingest source either as pre-encoded latents (zero VAE work)
+    // or by acquiring the VAE encoder and running it on src_audio. When both
+    // are provided latents win: they were either produced by a previous run
+    // or supplied verbatim by the client and need no further processing.
     s.have_cover = false;
     s.T_cover    = 0;
+    if (src_latents && src_T_latent > 0) {
+        s.cover_latents.assign(src_latents, src_latents + (size_t) src_T_latent * 64);
+        s.T_cover    = src_T_latent;
+        s.have_cover = true;
+        fprintf(stderr, "[Encode-Src] Latents in: T_cover=%d (%.2fs), VAE encode skipped\n", s.T_cover,
+                (float) s.T_cover * 1920.0f / 48000.0f);
+        return 0;
+    }
     if (src_audio && src_len > 0) {
         s.timer.reset();
         int T_audio = src_len;
 
-        VAEEncoder vae_enc = {};
-        vae_enc_load(&vae_enc, ctx->params.vae_path);
+        VAEEncoder * vae_enc = store_require_vae_enc(ctx->store, ctx->vae_enc_key);
+        if (!vae_enc) {
+            fprintf(stderr, "[Encode-Src] FATAL: store_require_vae_enc failed\n");
+            return -1;
+        }
+        ModelHandle vae_enc_guard(ctx->store, vae_enc);
+
         int max_T_lat = (T_audio / 1920) + 64;
         s.cover_latents.resize(max_T_lat * 64);
 
-        s.T_cover = vae_enc_encode_tiled(&vae_enc, src_audio, T_audio, s.cover_latents.data(), max_T_lat,
+        s.T_cover = vae_enc_encode_tiled(vae_enc, src_audio, T_audio, s.cover_latents.data(), max_T_lat,
                                          ctx->params.vae_chunk, ctx->params.vae_overlap);
-        vae_enc_free(&vae_enc);
         if (s.T_cover < 0) {
             fprintf(stderr, "[Encode-Src] FATAL: encode failed\n");
             return -1;
@@ -85,8 +168,7 @@ int ops_encode_src(AceSynth * ctx, const float * src_audio, int src_len, SynthSt
     return 0;
 }
 
-// ops_fsq_roundtrip
-void ops_fsq_roundtrip(AceSynth * ctx, SynthState & s) {
+void ops_fsq_roundtrip(const AceSynth * ctx, SynthState & s) {
     // FSQ roundtrip for cover: tokenize (25Hz->5Hz) + detokenize (5Hz->25Hz).
     // The lossy 5:1 temporal compression destroys micro-timings, ornaments and
     // transients. The DiT receives degraded latents and diverges from the source,
@@ -94,28 +176,59 @@ void ops_fsq_roundtrip(AceSynth * ctx, SynthState & s) {
     // cover-nofsq skips this call and feeds clean 25Hz VAE latents directly,
     // producing remixes that stay close to the source.
     // Other tasks (lego, extract, repaint, complete) also use clean latents.
-    if (s.have_cover && ctx->have_tok && ctx->have_detok) {
-        s.timer.reset();
-        int              T_5Hz = (s.T_cover + 4) / 5;
-        std::vector<int> codes(T_5Hz);
-        int              T_5Hz_actual =
-            tok_ggml_encode(&ctx->tok, s.cover_latents.data(), s.T_cover, codes.data(), ctx->silence_full.data());
-        if (T_5Hz_actual > 0) {
-            int                T_25Hz_rt = T_5Hz_actual * 5;
-            std::vector<float> rt_latents(T_25Hz_rt * 64);
-            int                ret = detok_ggml_decode(&ctx->detok, codes.data(), T_5Hz_actual, rt_latents.data());
-            if (ret >= 0) {
-                int copy_T = T_25Hz_rt < s.T_cover ? T_25Hz_rt : s.T_cover;
-                memcpy(s.cover_latents.data(), rt_latents.data(), (size_t) copy_T * 64 * sizeof(float));
-                fprintf(stderr, "[FSQ-Roundtrip] %d->%d->%d frames, %.1f ms\n", s.T_cover, T_5Hz_actual, copy_T,
-                        s.timer.ms());
-            }
-        }
+    if (!s.have_cover) {
+        return;
     }
+    s.timer.reset();
+    int              T_5Hz = (s.T_cover + 4) / 5;
+    std::vector<int> codes(T_5Hz);
+
+    // Tokenizer scope: acquire, encode 25Hz latents to 5Hz codes, release.
+    int T_5Hz_actual;
+    {
+        TokGGML * tok = store_require_fsq_tok(ctx->store, ctx->fsq_tok_key);
+        if (!tok) {
+            fprintf(stderr, "[FSQ-Roundtrip] FATAL: store_require_fsq_tok failed\n");
+            return;
+        }
+        ModelHandle tok_guard(ctx->store, tok);
+        if (!ctx->params.use_fa) {
+            tok->use_flash_attn = false;
+        }
+
+        T_5Hz_actual =
+            tok_ggml_encode(tok, s.cover_latents.data(), s.T_cover, codes.data(), ctx->meta->silence_full.data());
+    }
+    if (T_5Hz_actual <= 0) {
+        return;
+    }
+
+    // Detokenizer scope: acquire, decode 5Hz codes back to 25Hz latents, release.
+    int                T_25Hz_rt = T_5Hz_actual * 5;
+    std::vector<float> rt_latents(T_25Hz_rt * 64);
+    int                ret;
+    {
+        DetokGGML * detok = store_require_fsq_detok(ctx->store, ctx->fsq_detok_key);
+        if (!detok) {
+            fprintf(stderr, "[FSQ-Roundtrip] FATAL: store_require_fsq_detok failed\n");
+            return;
+        }
+        ModelHandle detok_guard(ctx->store, detok);
+        if (!ctx->params.use_fa) {
+            detok->use_flash_attn = false;
+        }
+
+        ret = detok_ggml_decode(detok, codes.data(), T_5Hz_actual, rt_latents.data());
+    }
+    if (ret < 0) {
+        return;
+    }
+    int copy_T = T_25Hz_rt < s.T_cover ? T_25Hz_rt : s.T_cover;
+    memcpy(s.cover_latents.data(), rt_latents.data(), (size_t) copy_T * 64 * sizeof(float));
+    fprintf(stderr, "[FSQ-Roundtrip] %d->%d->%d frames, %.1f ms\n", s.T_cover, T_5Hz_actual, copy_T, s.timer.ms());
 }
 
-// ops_resolve_params
-int ops_resolve_params(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
+int ops_resolve_params(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
     // Extract shared params from first request
     s.duration = s.rr.duration > 0 ? s.rr.duration : 30.0f;
 
@@ -127,7 +240,7 @@ int ops_resolve_params(AceSynth * ctx, const AceRequest * reqs, int batch_n, Syn
     s.shift          = s.rr.shift;
 
     if (s.num_steps <= 0) {
-        s.num_steps = ctx->is_turbo ? 8 : 50;
+        s.num_steps = ctx->meta->is_turbo ? 8 : 50;
     }
     if (s.num_steps > 500) {
         fprintf(stderr, "[Resolve-Params] WARNING: inference_steps %d clamped to 100\n", s.num_steps);
@@ -136,27 +249,32 @@ int ops_resolve_params(AceSynth * ctx, const AceRequest * reqs, int batch_n, Syn
 
     if (s.guidance_scale <= 0.0f) {
         s.guidance_scale = 1.0f;
-    } else if (ctx->is_turbo && s.guidance_scale > 1.0f) {
-        fprintf(stderr, "[Resolve-Params] WARNING: turbo model, forcing guidance_scale=1.0 (was %.1f)\n",
+    } else if (ctx->meta->is_turbo && s.guidance_scale > 1.0f) {
+        fprintf(stderr,
+                "[Resolve-Params] WARNING: guidance_scale=%.1f on turbo model. "
+                "Distilled turbo internalizes guidance; stacking CFG on top usually "
+                "oversaturates. Use it only if you know what you do (typically a merge).\n",
                 s.guidance_scale);
-        s.guidance_scale = 1.0f;
     }
 
     if (s.shift <= 0.0f) {
-        s.shift = ctx->is_turbo ? 3.0f : 1.0f;
+        s.shift = ctx->meta->is_turbo ? 3.0f : 1.0f;
     }
 
-    // Audio codes: scan all requests to determine s.T from the longest code set.
-    // Per-batch codes are decoded in the s.context building loop below.
+    // Audio codes: parse once per request and stash in s.per_codes so
+    // ops_build_context does not have to re-parse. Also records the longest
+    // set (drives s.T) and whether any batch item carries codes at all.
     // Shorter code sets are padded with silence, longer ones are never truncated.
+    s.per_codes.assign(batch_n, {});
     s.max_codes_len = 0;
     s.have_codes    = false;
     for (int b = 0; b < batch_n; b++) {
-        std::vector<int> cb = parse_codes_string(reqs[b].audio_codes);
-        if ((int) cb.size() > s.max_codes_len) {
-            s.max_codes_len = (int) cb.size();
+        s.per_codes[b] = parse_csv<int>(reqs[b].audio_codes);
+        int sz         = (int) s.per_codes[b].size();
+        if (sz > s.max_codes_len) {
+            s.max_codes_len = sz;
         }
-        if (!cb.empty()) {
+        if (sz > 0) {
             s.have_codes = true;
         }
     }
@@ -164,17 +282,26 @@ int ops_resolve_params(AceSynth * ctx, const AceRequest * reqs, int batch_n, Syn
         fprintf(stderr, "[Resolve-Params] max audio codes across batch: %d (%.1fs @ 5Hz)\n", s.max_codes_len,
                 (float) s.max_codes_len / 5.0f);
     }
-    if (s.have_codes && !ctx->have_detok) {
-        fprintf(stderr, "[Resolve-Params] FATAL: detokenizer not found\n");
-        return -1;
-    }
 
     return 0;
 }
 
-// ops_build_schedule
 void ops_build_schedule(SynthState & s) {
-    // Build s.schedule: t_i = s.shift * t / (1 + (s.shift-1)*t) where t = 1 - i/steps
+    // Custom timesteps override: CSV floats like
+    // "0.97,0.76,0.615,0.5,0.395,0.28,0.18,0.085,0". Last value is the x0
+    // endpoint handled implicitly by the sampler, so we drop it and take
+    // schedule = first N-1 entries, num_steps = N-1.
+    if (!s.rr.custom_timesteps.empty()) {
+        std::vector<float> ts = parse_csv<float>(s.rr.custom_timesteps);
+        if (ts.size() >= 2) {
+            s.num_steps = (int) ts.size() - 1;
+            s.schedule.assign(ts.begin(), ts.end() - 1);
+            fprintf(stderr, "[Build-Schedule] Custom timesteps: %d steps\n", s.num_steps);
+            return;
+        }
+        fprintf(stderr, "[Build-Schedule] WARN: custom_timesteps needs >= 2 values, falling back to shift\n");
+    }
+    // Default: t_i = shift * t / (1 + (shift-1)*t) with t = 1 - i/steps
     s.schedule.resize(s.num_steps);
     for (int i = 0; i < s.num_steps; i++) {
         float t       = 1.0f - (float) i / (float) s.num_steps;
@@ -182,8 +309,7 @@ void ops_build_schedule(SynthState & s) {
     }
 }
 
-// ops_resolve_T
-int ops_resolve_T(AceSynth * ctx, SynthState & s) {
+int ops_resolve_T(const AceSynth * ctx, SynthState & s) {
     // s.T = number of 25Hz latent frames for DiT
     // Source tasks: from source audio. Codes: from code count. Else: from s.duration.
     if (s.use_source_context && s.have_cover) {
@@ -200,8 +326,8 @@ int ops_resolve_T(AceSynth * ctx, SynthState & s) {
     } else {
         s.T = (int) (s.duration * FRAMES_PER_SECOND);
     }
-    s.T     = ((s.T + ctx->dit.cfg.patch_size - 1) / ctx->dit.cfg.patch_size) * ctx->dit.cfg.patch_size;
-    s.S     = s.T / ctx->dit.cfg.patch_size;
+    s.T     = ((s.T + ctx->meta->cfg.patch_size - 1) / ctx->meta->cfg.patch_size) * ctx->meta->cfg.patch_size;
+    s.S     = s.T / ctx->meta->cfg.patch_size;
     s.enc_S = 0;
 
     fprintf(stderr, "[Resolve-T] T=%d, S=%d\n", s.T, s.S);
@@ -216,185 +342,215 @@ int ops_resolve_T(AceSynth * ctx, SynthState & s) {
     return 0;
 }
 
-// ops_clamp_region
-int ops_clamp_region(SynthState & s) {
-    // Clamp rs/re to source duration. Caller ensures this is a region task.
-    float src_dur = (float) s.T_cover * 1920.0f / 48000.0f;
-    if (s.rs < 0.0f) {
-        s.rs = 0.0f;
+void ops_encode_timbre(const AceSynth * ctx,
+                       const float *    ref_audio,
+                       int              ref_len,
+                       const float *    ref_latents,
+                       int              ref_T_latent,
+                       SynthState &     s) {
+    // Timbre features from ref_audio or ref_latents (independent of src).
+    // Two paths converge into s.timbre_feats: pre-encoded latents skip the
+    // VAE encoder entirely, raw audio takes the encoder path. Latents win
+    // when both are set. Without either input the timbre falls back to a
+    // single silence frame, disabling timbre conditioning.
+    if (ref_latents && ref_T_latent > 0) {
+        s.S_ref_timbre = ref_T_latent;
+        s.timbre_feats.assign(ref_latents, ref_latents + (size_t) ref_T_latent * 64);
+        fprintf(stderr, "[Encode-Timbre] Latents in: %d frames (%.1fs), VAE encode skipped\n", ref_T_latent,
+                (float) ref_T_latent / 25.0f);
+        return;
     }
-    if (s.re < 0.0f) {
-        s.re = src_dur;
-    }
-    if (s.rs > src_dur) {
-        s.rs = src_dur;
-    }
-    if (s.re > src_dur) {
-        s.re = src_dur;
-    }
-    if (s.re <= s.rs) {
-        fprintf(stderr, "[Clamp-Region] ERROR: repainting_end (%.1f) <= repainting_start (%.1f)\n", s.re, s.rs);
-        return -1;
-    }
-    fprintf(stderr, "[Clamp-Region] %.1fs..%.1fs (src=%.1fs)\n", s.rs, s.re, src_dur);
-    return 0;
-}
-
-// ops_encode_timbre
-void ops_encode_timbre(AceSynth * ctx, const float * ref_audio, int ref_len, SynthState & s) {
-    // Timbre features from ref_audio (independent of src_audio).
-    // VAE-encode ref_audio and pass all frames to the timbre encoder.
-    // NULL ref_audio = single silence frame (no timbre conditioning).
     if (ref_audio && ref_len > 0) {
         s.timer.reset();
-        VAEEncoder ref_vae = {};
-        vae_enc_load(&ref_vae, ctx->params.vae_path);
+        VAEEncoder * ref_vae = store_require_vae_enc(ctx->store, ctx->vae_enc_key);
+        if (!ref_vae) {
+            fprintf(stderr, "[Encode-Timbre] WARNING: store_require_vae_enc failed, using silence\n");
+            s.S_ref_timbre = 1;
+            s.timbre_feats.assign(ctx->meta->silence_full.data(), ctx->meta->silence_full.data() + 64);
+            return;
+        }
+        ModelHandle ref_vae_guard(ctx->store, ref_vae);
+
         int                max_T_ref = (ref_len / 1920) + 64;
-        std::vector<float> ref_latents(max_T_ref * 64);
-        int                T_ref = vae_enc_encode_tiled(&ref_vae, ref_audio, ref_len, ref_latents.data(), max_T_ref,
+        std::vector<float> ref_lat_buf(max_T_ref * 64);
+        int                T_ref = vae_enc_encode_tiled(ref_vae, ref_audio, ref_len, ref_lat_buf.data(), max_T_ref,
                                                         ctx->params.vae_chunk, ctx->params.vae_overlap);
-        vae_enc_free(&ref_vae);
         if (T_ref < 0) {
             fprintf(stderr, "[Encode-Timbre] WARNING: ref_audio encode failed, using silence\n");
             s.S_ref_timbre = 1;
-            s.timbre_feats.assign(ctx->silence_full.data(), ctx->silence_full.data() + 64);
+            s.timbre_feats.assign(ctx->meta->silence_full.data(), ctx->meta->silence_full.data() + 64);
         } else {
             s.S_ref_timbre = T_ref;
-            s.timbre_feats.assign(ref_latents.data(), ref_latents.data() + (size_t) T_ref * 64);
+            s.timbre_feats.assign(ref_lat_buf.data(), ref_lat_buf.data() + (size_t) T_ref * 64);
             fprintf(stderr, "[Encode-Timbre] ref_audio: %d frames (%.1fs), %.1f ms\n", T_ref, (float) T_ref / 25.0f,
                     s.timer.ms());
         }
     } else {
         s.S_ref_timbre = 1;
-        s.timbre_feats.assign(ctx->silence_full.data(), ctx->silence_full.data() + 64);
+        s.timbre_feats.assign(ctx->meta->silence_full.data(), ctx->meta->silence_full.data() + 64);
     }
 }
 
-// ops_encode_text
-int ops_encode_text(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
-    // 3. Per-batch text encoding.
-    // Each batch element gets its own caption, lyrics, and metadata encoded independently.
-    // TextEncoder + CondEncoder run in series (cheap: ~13ms per element).
-    // Results are padded to s.max_enc_S with null_cond and stacked for a single DiT batch pass.
-    int H_text = ctx->text_enc.cfg.hidden_size;     // 1024
-    int H_cond = (int) ctx->dit.cond_emb_w->ne[0];  // encoder hidden size (2048)
+// Per-batch CPU-resident forward from the text encoder.
+// Lives in a local array between the text_enc and cond_enc phases so the
+// two GPU modules never need to coexist under EVICT_STRICT.
+struct TextEncForward {
+    std::vector<float> text_hidden;  // [S_text * H_text] f32
+    std::vector<float> lyric_embed;  // [S_lyric * H_text] f32
+    int                S_text;
+    int                S_lyric;
+};
 
-    // read null_condition_emb from GPU for padding shorter encodings
-    s.null_cond_vec.resize(H_cond);
-    if (ctx->dit.null_condition_emb) {
-        int emb_n = (int) ggml_nelements(ctx->dit.null_condition_emb);
-        if (ctx->dit.null_condition_emb->type == GGML_TYPE_BF16) {
-            std::vector<uint16_t> bf16_buf(emb_n);
-            ggml_backend_tensor_get(ctx->dit.null_condition_emb, bf16_buf.data(), 0, emb_n * sizeof(uint16_t));
-            for (int i = 0; i < emb_n; i++) {
-                uint32_t w = (uint32_t) bf16_buf[i] << 16;
-                memcpy(&s.null_cond_vec[i], &w, 4);
-            }
-        } else {
-            ggml_backend_tensor_get(ctx->dit.null_condition_emb, s.null_cond_vec.data(), 0, emb_n * sizeof(float));
-        }
+// Build the text/lyric prompt pair that feeds the text encoder for one batch
+// element. instruction is the DiT instruction header (main or non-cover).
+static void build_prompt_strings(const AceRequest &  rb,
+                                 const std::string & instruction,
+                                 float               duration,
+                                 std::string &       text_out,
+                                 std::string &       lyric_out) {
+    char bpm_b[16] = "N/A";
+    if (rb.bpm > 0) {
+        snprintf(bpm_b, sizeof(bpm_b), "%d", rb.bpm);
     }
+    const char * keyscale_b = rb.keyscale.empty() ? "N/A" : rb.keyscale.c_str();
+    const char * timesig_b  = rb.timesignature.empty() ? "N/A" : rb.timesignature.c_str();
+    const char * language_b = rb.vocal_language.empty() ? "unknown" : rb.vocal_language.c_str();
 
-    // instruction_str must be set by the orchestrator. Empty means unknown task or bug.
+    char metas_b[512];
+    snprintf(metas_b, sizeof(metas_b), "- bpm: %s\n- timesignature: %s\n- keyscale: %s\n- duration: %d seconds\n",
+             bpm_b, timesig_b, keyscale_b, (int) duration);
+    text_out = std::string("# Instruction\n") + instruction + "\n\n" + "# Caption\n" + rb.caption + "\n\n" +
+               "# Metas\n" + metas_b + "<|endoftext|>\n";
+    lyric_out = std::string("# Languages\n") + language_b + "\n\n# Lyric\n" + rb.lyrics + "<|endoftext|>";
+}
+
+int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
+    // Per-batch text encoding in two GPU phases to keep EVICT_STRICT at one
+    // module resident at a time:
+    //   Phase A: acquire text_enc, run all qwen3 forwards (main and optional
+    //            non-cover) into CPU-resident TextEncForward, release.
+    //   Phase B: acquire cond_enc, run all cond_ggml forwards consuming those
+    //            cached hidden states into s.per_enc / s.per_enc_nc, release.
+    // Intermediate CPU footprint peaks at roughly batch_n * 2 * S * H_text * 4
+    // bytes (a few MB), negligible next to the GPU modules.
     if (s.instruction_str.empty()) {
         fprintf(stderr, "[Encode-Text] FATAL: instruction_str is empty (unknown task or orchestrator bug)\n");
         return -1;
     }
 
-    // encode each batch element independently
-    s.per_enc.resize(batch_n);
-    s.per_enc_S.resize(batch_n);
+    s.need_enc_switch = s.use_source_context && !s.is_repaint && !s.is_lego_region && s.rr.audio_cover_strength < 1.0f;
 
-    for (int b = 0; b < batch_n; b++) {
-        const AceRequest & rb = reqs[b];
-
-        // per-batch metadata
-        char bpm_b[16] = "N/A";
-        if (rb.bpm > 0) {
-            snprintf(bpm_b, sizeof(bpm_b), "%d", rb.bpm);
-        }
-        const char * keyscale_b = rb.keyscale.empty() ? "N/A" : rb.keyscale.c_str();
-        const char * timesig_b  = rb.timesignature.empty() ? "N/A" : rb.timesignature.c_str();
-        const char * language_b = rb.vocal_language.empty() ? "unknown" : rb.vocal_language.c_str();
-
-        char metas_b[512];
-        snprintf(metas_b, sizeof(metas_b), "- bpm: %s\n- timesignature: %s\n- keyscale: %s\n- duration: %d seconds\n",
-                 bpm_b, timesig_b, keyscale_b, (int) s.duration);
-        std::string text_str = std::string("# Instruction\n") + s.instruction_str + "\n\n" + "# Caption\n" +
-                               rb.caption + "\n\n" + "# Metas\n" + metas_b + "<|endoftext|>\n";
-        std::string lyric_str =
-            std::string("# Languages\n") + language_b + "\n\n# Lyric\n" + rb.lyrics + "<|endoftext|>";
-
-        // tokenize
-        auto text_ids  = bpe_encode(&ctx->bpe, text_str.c_str(), true);
-        auto lyric_ids = bpe_encode(&ctx->bpe, lyric_str.c_str(), true);
-        int  S_text    = (int) text_ids.size();
-        int  S_lyric   = (int) lyric_ids.size();
-
-        // TextEncoder forward
-        std::vector<float> text_hidden(H_text * S_text);
-        qwen3_forward(&ctx->text_enc, text_ids.data(), S_text, text_hidden.data());
-
-        // lyric embedding (vocab lookup)
-        std::vector<float> lyric_embed(H_text * S_lyric);
-        qwen3_embed_lookup(&ctx->text_enc, lyric_ids.data(), S_lyric, lyric_embed.data());
-
-        // CondEncoder forward
-        s.timer.reset();
-        cond_ggml_forward(&ctx->cond_enc, text_hidden.data(), S_text, lyric_embed.data(), S_lyric,
-                          s.timbre_feats.data(), s.S_ref_timbre, s.per_enc[b], &s.per_enc_S[b]);
-        fprintf(stderr, "[Encode-Text Batch%d] %d+%d tokens -> enc_S=%d, %.1f ms\n", b, S_text, S_lyric, s.per_enc_S[b],
-                s.timer.ms());
-
-        if (b == 0) {
-            debug_dump_2d(&s.dbg, "text_hidden", text_hidden.data(), S_text, H_text);
-            debug_dump_2d(&s.dbg, "lyric_embed", lyric_embed.data(), S_lyric, H_text);
-            debug_dump_2d(&s.dbg, "enc_hidden", s.per_enc[b].data(), s.per_enc_S[b], H_cond);
-        }
+    BPETokenizer * bpe = store_bpe(ctx->store, ctx->params.text_encoder_path);
+    if (!bpe) {
+        fprintf(stderr, "[Encode-Text] FATAL: store_bpe failed\n");
+        return -1;
     }
 
-    // second encoding pass using s.nc_instruction_str (set by orchestrator).
-    // used after s.cover_steps when audio_cover_strength < 1.0 (s.context switches to silence).
-    s.need_enc_switch = s.use_source_context && !s.is_repaint && !s.is_lego_region && s.rr.audio_cover_strength < 1.0f;
-    s.per_enc_nc.resize(batch_n);
-    s.per_enc_S_nc.assign(batch_n, 0);
+    std::vector<TextEncForward> main_fwd(batch_n);
+    std::vector<TextEncForward> nc_fwd(s.need_enc_switch ? batch_n : 0);
+    int                         H_text = 0;
 
-    if (s.need_enc_switch) {
+    // Phase A: text encoder.
+    {
+        Qwen3GGML * te = store_require_text_enc(ctx->store, ctx->text_enc_key);
+        if (!te) {
+            fprintf(stderr, "[Encode-Text] FATAL: store_require_text_enc failed\n");
+            return -1;
+        }
+        ModelHandle te_guard(ctx->store, te);
+        if (!ctx->params.use_fa) {
+            te->use_flash_attn = false;
+        }
+
+        H_text = te->cfg.hidden_size;
+
         for (int b = 0; b < batch_n; b++) {
-            const AceRequest & rb = reqs[b];
+            std::string text_str;
+            std::string lyric_str;
+            build_prompt_strings(reqs[b], s.instruction_str, s.duration, text_str, lyric_str);
 
-            char bpm_b[16] = "N/A";
-            if (rb.bpm > 0) {
-                snprintf(bpm_b, sizeof(bpm_b), "%d", rb.bpm);
-            }
-            const char * keyscale_b = rb.keyscale.empty() ? "N/A" : rb.keyscale.c_str();
-            const char * timesig_b  = rb.timesignature.empty() ? "N/A" : rb.timesignature.c_str();
-            const char * language_b = rb.vocal_language.empty() ? "unknown" : rb.vocal_language.c_str();
-
-            char metas_b[512];
-            snprintf(metas_b, sizeof(metas_b),
-                     "- bpm: %s\n- timesignature: %s\n- keyscale: %s\n- duration: %d seconds\n", bpm_b, timesig_b,
-                     keyscale_b, (int) s.duration);
-            std::string text_str = std::string("# Instruction\n") + s.nc_instruction_str + "\n\n" + "# Caption\n" +
-                                   rb.caption + "\n\n" + "# Metas\n" + metas_b + "<|endoftext|>\n";
-            std::string lyric_str =
-                std::string("# Languages\n") + language_b + "\n\n# Lyric\n" + rb.lyrics + "<|endoftext|>";
-
-            auto text_ids  = bpe_encode(&ctx->bpe, text_str.c_str(), true);
-            auto lyric_ids = bpe_encode(&ctx->bpe, lyric_str.c_str(), true);
+            auto text_ids  = bpe_encode(bpe, text_str.c_str(), true);
+            auto lyric_ids = bpe_encode(bpe, lyric_str.c_str(), true);
             int  S_text    = (int) text_ids.size();
             int  S_lyric   = (int) lyric_ids.size();
 
-            std::vector<float> text_hidden(H_text * S_text);
-            qwen3_forward(&ctx->text_enc, text_ids.data(), S_text, text_hidden.data());
+            main_fwd[b].S_text  = S_text;
+            main_fwd[b].S_lyric = S_lyric;
+            main_fwd[b].text_hidden.resize((size_t) H_text * S_text);
+            qwen3_forward(te, text_ids.data(), S_text, main_fwd[b].text_hidden.data());
+            main_fwd[b].lyric_embed.resize((size_t) H_text * S_lyric);
+            qwen3_embed_lookup(te, lyric_ids.data(), S_lyric, main_fwd[b].lyric_embed.data());
+        }
 
-            std::vector<float> lyric_embed(H_text * S_lyric);
-            qwen3_embed_lookup(&ctx->text_enc, lyric_ids.data(), S_lyric, lyric_embed.data());
+        if (s.need_enc_switch) {
+            for (int b = 0; b < batch_n; b++) {
+                std::string text_str;
+                std::string lyric_str;
+                build_prompt_strings(reqs[b], DIT_INSTR_TEXT2MUSIC, s.duration, text_str, lyric_str);
 
-            cond_ggml_forward(&ctx->cond_enc, text_hidden.data(), S_text, lyric_embed.data(), S_lyric,
-                              s.timbre_feats.data(), s.S_ref_timbre, s.per_enc_nc[b], &s.per_enc_S_nc[b]);
-            fprintf(stderr, "[Encode-Text Batch%d] non-cover: %d+%d tokens -> enc_S=%d\n", b, S_text, S_lyric,
-                    s.per_enc_S_nc[b]);
+                auto text_ids  = bpe_encode(bpe, text_str.c_str(), true);
+                auto lyric_ids = bpe_encode(bpe, lyric_str.c_str(), true);
+                int  S_text    = (int) text_ids.size();
+                int  S_lyric   = (int) lyric_ids.size();
+
+                nc_fwd[b].S_text  = S_text;
+                nc_fwd[b].S_lyric = S_lyric;
+                nc_fwd[b].text_hidden.resize((size_t) H_text * S_text);
+                qwen3_forward(te, text_ids.data(), S_text, nc_fwd[b].text_hidden.data());
+                nc_fwd[b].lyric_embed.resize((size_t) H_text * S_lyric);
+                qwen3_embed_lookup(te, lyric_ids.data(), S_lyric, nc_fwd[b].lyric_embed.data());
+            }
+        }
+
+        // Debug dump of sample 0 while text_hidden and lyric_embed are live.
+        debug_dump_2d(&s.dbg, "text_hidden", main_fwd[0].text_hidden.data(), main_fwd[0].S_text, H_text);
+        debug_dump_2d(&s.dbg, "lyric_embed", main_fwd[0].lyric_embed.data(), main_fwd[0].S_lyric, H_text);
+    }
+
+    // Phase B: condition encoder.
+    int H_cond = 0;
+    s.per_enc.resize(batch_n);
+    s.per_enc_S.resize(batch_n);
+    s.per_enc_nc.resize(batch_n);
+    s.per_enc_S_nc.assign(batch_n, 0);
+    {
+        CondGGML * ce = store_require_cond_enc(ctx->store, ctx->cond_enc_key);
+        if (!ce) {
+            fprintf(stderr, "[Encode-Text] FATAL: store_require_cond_enc failed\n");
+            return -1;
+        }
+        ModelHandle ce_guard(ctx->store, ce);
+        if (!ctx->params.use_fa) {
+            ce->use_flash_attn = false;
+        }
+        ce->clamp_fp16 = ctx->params.clamp_fp16;
+
+        H_cond = ce->lyric_cfg.hidden_size;
+
+        // null_condition_emb lives on the DiTMeta. Empty when the model has none.
+        s.null_cond_vec.resize(H_cond);
+        if (!ctx->meta->null_cond_cpu.empty()) {
+            memcpy(s.null_cond_vec.data(), ctx->meta->null_cond_cpu.data(), H_cond * sizeof(float));
+        }
+
+        for (int b = 0; b < batch_n; b++) {
+            s.timer.reset();
+            cond_ggml_forward(ce, main_fwd[b].text_hidden.data(), main_fwd[b].S_text, main_fwd[b].lyric_embed.data(),
+                              main_fwd[b].S_lyric, s.timbre_feats.data(), s.S_ref_timbre, s.per_enc[b],
+                              &s.per_enc_S[b]);
+            fprintf(stderr, "[Encode-Text Batch%d] %d+%d tokens -> enc_S=%d, %.1f ms\n", b, main_fwd[b].S_text,
+                    main_fwd[b].S_lyric, s.per_enc_S[b], s.timer.ms());
+        }
+        debug_dump_2d(&s.dbg, "enc_hidden", s.per_enc[0].data(), s.per_enc_S[0], H_cond);
+
+        if (s.need_enc_switch) {
+            for (int b = 0; b < batch_n; b++) {
+                cond_ggml_forward(ce, nc_fwd[b].text_hidden.data(), nc_fwd[b].S_text, nc_fwd[b].lyric_embed.data(),
+                                  nc_fwd[b].S_lyric, s.timbre_feats.data(), s.S_ref_timbre, s.per_enc_nc[b],
+                                  &s.per_enc_S_nc[b]);
+                fprintf(stderr, "[Encode-Text Batch%d] non-cover: %d+%d tokens -> enc_S=%d\n", b, nc_fwd[b].S_text,
+                        nc_fwd[b].S_lyric, s.per_enc_S_nc[b]);
+            }
         }
     }
 
@@ -411,9 +567,9 @@ int ops_encode_text(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthS
     }
     s.enc_S = s.max_enc_S;
 
-    s.enc_hidden.resize(H_cond * s.max_enc_S * batch_n);
+    s.enc_hidden.resize((size_t) H_cond * s.max_enc_S * batch_n);
     for (int b = 0; b < batch_n; b++) {
-        float * dst = s.enc_hidden.data() + b * s.max_enc_S * H_cond;
+        float * dst = s.enc_hidden.data() + (size_t) b * s.max_enc_S * H_cond;
         memcpy(dst, s.per_enc[b].data(), (size_t) s.per_enc_S[b] * H_cond * sizeof(float));
         for (int si = s.per_enc_S[b]; si < s.max_enc_S; si++) {
             memcpy(dst + si * H_cond, s.null_cond_vec.data(), H_cond * sizeof(float));
@@ -422,10 +578,10 @@ int ops_encode_text(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthS
 
     // pad and stack text2music encoding (same s.max_enc_S for graph compatibility)
     if (s.need_enc_switch) {
-        s.enc_hidden_nc.resize(H_cond * s.max_enc_S * batch_n);
+        s.enc_hidden_nc.resize((size_t) H_cond * s.max_enc_S * batch_n);
         s.per_enc_S_nc_final.resize(batch_n);
         for (int b = 0; b < batch_n; b++) {
-            float * dst = s.enc_hidden_nc.data() + b * s.max_enc_S * H_cond;
+            float * dst = s.enc_hidden_nc.data() + (size_t) b * s.max_enc_S * H_cond;
             memcpy(dst, s.per_enc_nc[b].data(), (size_t) s.per_enc_S_nc[b] * H_cond * sizeof(float));
             for (int si = s.per_enc_S_nc[b]; si < s.max_enc_S; si++) {
                 memcpy(dst + si * H_cond, s.null_cond_vec.data(), H_cond * sizeof(float));
@@ -441,8 +597,7 @@ int ops_encode_text(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthS
     return 0;
 }
 
-// ops_build_context
-int ops_build_context(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
+int ops_build_context(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
     // Build s.context: [batch_n, s.T, s.ctx_ch] = src_latents[64] + chunk_mask[64]
     // Cover/Lego/Repaint: shared s.context replicated (s.cover_latents from src_audio).
     // Passthrough: per-batch detokenized FSQ codes + silence padding, mask = 1.0.
@@ -474,9 +629,9 @@ int ops_build_context(AceSynth * ctx, const AceRequest * reqs, int batch_n, Synt
             // lego keeps full cover everywhere (DiT hears the whole backing track).
             const float * src;
             if (s.is_repaint && in_region) {
-                src = ctx->silence_full.data() + t * s.Oc;
+                src = ctx->meta->silence_full.data() + t * s.Oc;
             } else {
-                src = (t < s.T_cover) ? s.cover_latents.data() + t * s.Oc : ctx->silence_full.data() + t * s.Oc;
+                src = (t < s.T_cover) ? s.cover_latents.data() + t * s.Oc : ctx->meta->silence_full.data() + t * s.Oc;
             }
             // region tasks: explicit 0/1 mask. all others: 1.0 (training distribution).
             float mask_val;
@@ -504,37 +659,61 @@ int ops_build_context(AceSynth * ctx, const AceRequest * reqs, int batch_n, Synt
             return -1;
         }
 
-        // Text2music / codes passthrough: per-batch context with per-batch audio_codes
-        for (int b = 0; b < batch_n; b++) {
-            float * ctx_dst = s.context.data() + b * s.T * s.ctx_ch;
+        // Decode batch items with audio codes through the FSQ detokenizer, cached
+        // in CPU buffers before the fill loop so the detokenizer is held for the
+        // shortest possible window under STRICT.
+        std::vector<std::vector<float>> decoded_per_b(batch_n);
+        std::vector<int>                decoded_T_per_b(batch_n, 0);
 
-            // decode this batch item's audio codes (if any)
-            int                decoded_T = 0;
-            std::vector<float> decoded_latents;
-            std::vector<int>   codes_b = parse_codes_string(reqs[b].audio_codes);
-            if (!codes_b.empty()) {
+        // s.have_codes is already posed by ops_resolve_params over the same batch.
+        bool any_codes = s.have_codes;
+
+        if (any_codes) {
+            DetokGGML * detok = store_require_fsq_detok(ctx->store, ctx->fsq_detok_key);
+            if (!detok) {
+                fprintf(stderr, "[Build-Context] FATAL: store_require_fsq_detok failed\n");
+                return -1;
+            }
+            ModelHandle detok_guard(ctx->store, detok);
+            if (!ctx->params.use_fa) {
+                detok->use_flash_attn = false;
+            }
+
+            for (int b = 0; b < batch_n; b++) {
+                const std::vector<int> & codes_b = s.per_codes[b];
+                if (codes_b.empty()) {
+                    continue;
+                }
                 s.timer.reset();
                 int T_5Hz        = (int) codes_b.size();
                 int T_25Hz_codes = T_5Hz * 5;
-                decoded_latents.resize(T_25Hz_codes * s.Oc);
+                decoded_per_b[b].resize((size_t) T_25Hz_codes * s.Oc);
 
-                int ret = detok_ggml_decode(&ctx->detok, codes_b.data(), T_5Hz, decoded_latents.data());
+                int ret = detok_ggml_decode(detok, codes_b.data(), T_5Hz, decoded_per_b[b].data());
                 if (ret < 0) {
                     fprintf(stderr, "[Build-Context Batch%d] FATAL: detokenizer decode failed\n", b);
                     return -1;
                 }
                 fprintf(stderr, "[Build-Context Batch%d] Detokenizer: %.1f ms, %d codes\n", b, s.timer.ms(), T_5Hz);
 
-                decoded_T = T_25Hz_codes < s.T ? T_25Hz_codes : s.T;
+                decoded_T_per_b[b] = T_25Hz_codes < s.T ? T_25Hz_codes : s.T;
                 if (b == 0) {
-                    debug_dump_2d(&s.dbg, "detok_output", decoded_latents.data(), T_25Hz_codes, s.Oc);
+                    debug_dump_2d(&s.dbg, "detok_output", decoded_per_b[b].data(), T_25Hz_codes, s.Oc);
                 }
             }
+        }
 
-            // fill s.context: decoded latents then silence, mask = 1.0 (training distribution)
+        // Fill s.context: decoded latents then silence, mask = 1.0 (training distribution).
+        // The detokenizer is already released at this point; the CPU buffers in
+        // decoded_per_b carry everything we need.
+        for (int b = 0; b < batch_n; b++) {
+            float *       ctx_dst   = s.context.data() + b * s.T * s.ctx_ch;
+            const float * decoded   = decoded_per_b[b].data();
+            int           decoded_T = decoded_T_per_b[b];
+
             for (int t = 0; t < s.T; t++) {
-                const float * src = (t < decoded_T) ? decoded_latents.data() + t * s.Oc :
-                                                      ctx->silence_full.data() + (t - decoded_T) * s.Oc;
+                const float * src =
+                    (t < decoded_T) ? decoded + t * s.Oc : ctx->meta->silence_full.data() + (t - decoded_T) * s.Oc;
                 for (int c = 0; c < s.Oc; c++) {
                     ctx_dst[t * s.ctx_ch + c] = src[c];
                 }
@@ -548,8 +727,7 @@ int ops_build_context(AceSynth * ctx, const AceRequest * reqs, int batch_n, Synt
     return 0;
 }
 
-// ops_build_context_silence
-void ops_build_context_silence(AceSynth * ctx, int batch_n, SynthState & s) {
+void ops_build_context_silence(const AceSynth * ctx, int batch_n, SynthState & s) {
     // Cover mode: build silence s.context for audio_cover_strength switching
     // When step >= s.cover_steps, DiT switches from cover s.context to silence s.context
     // Repaint/lego_region: mask handles region; s.context switch never applies
@@ -560,7 +738,7 @@ void ops_build_context_silence(AceSynth * ctx, int batch_n, SynthState & s) {
             // Build silence s.context: all frames use silence_latent
             std::vector<float> silence_single(s.T * s.ctx_ch);
             for (int t = 0; t < s.T; t++) {
-                const float * src = ctx->silence_full.data() + t * s.Oc;
+                const float * src = ctx->meta->silence_full.data() + t * s.Oc;
                 for (int c = 0; c < s.Oc; c++) {
                     silence_single[t * s.ctx_ch + c] = src[c];
                 }
@@ -580,8 +758,7 @@ void ops_build_context_silence(AceSynth * ctx, int batch_n, SynthState & s) {
     }
 }
 
-// ops_init_noise_and_repaint
-void ops_init_noise_and_repaint(AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
+void ops_init_noise(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {
     // Generate N s.noise samples (Philox4x32-10, matches torch.randn on CUDA with bf16).
     // Each batch item uses its own seed from the request.
     s.noise.resize(batch_n * s.Oc * s.T);
@@ -590,8 +767,8 @@ void ops_init_noise_and_repaint(AceSynth * ctx, const AceRequest * reqs, int bat
         float * dst = s.noise.data() + b * s.Oc * s.T;
         s.seeds[b]  = reqs[b].seed;
         philox_randn(reqs[b].seed, dst, s.Oc * s.T, /*bf16_round=*/true);
-        fprintf(stderr, "[Init-Noise Batch%d] Philox noise seed=%lld, [%d, %d]%s\n", b, (long long) reqs[b].seed, s.T,
-                s.Oc, s.use_sde ? " (SDE)" : "");
+        fprintf(stderr, "[Init-Noise Batch%d] Philox noise seed=%lld, [%d, %d] solver=%s\n", b,
+                (long long) reqs[b].seed, s.T, s.Oc, s.rr.solver.c_str());
     }
 
     // cover_noise_strength: blend initial noise with clean source latents.
@@ -653,139 +830,137 @@ void ops_init_noise_and_repaint(AceSynth * ctx, const AceRequest * reqs, int bat
 
     fprintf(stderr, "[Init-Noise] Starting: T=%d, S=%d, enc_S=%d, steps=%d, batch=%d%s\n", s.T, s.S, s.enc_S,
             s.num_steps, batch_n, s.use_source_context ? " (cover)" : "");
-
-    // repaint/lego-region injection buffer: full cover latents padded with silence.
-    // used for step injection and boundary blend in both repaint and lego-region modes.
-    if (s.is_repaint || s.is_lego_region) {
-        s.repaint_src.resize(s.T * s.Oc);
-        for (int t = 0; t < s.T; t++) {
-            const float * src =
-                (t < s.T_cover) ? s.cover_latents.data() + t * s.Oc : ctx->silence_full.data() + t * s.Oc;
-            memcpy(s.repaint_src.data() + t * s.Oc, src, s.Oc * sizeof(float));
-        }
-    }
 }
 
-// ops_dit_generate
-int ops_dit_generate(AceSynth * ctx, int batch_n, SynthState & s, bool (*cancel)(void *), void * cancel_data) {
+int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*cancel)(void *), void * cancel_data) {
+    DiTGGML * dit = store_require_dit(ctx->store, ctx->dit_key);
+    if (!dit) {
+        fprintf(stderr, "[DiT-Generate] FATAL: store_require_dit failed\n");
+        return -1;
+    }
+    ModelHandle dit_guard(ctx->store, dit);
+    if (!ctx->params.use_fa) {
+        dit->use_flash_attn = false;
+    }
+
     s.timer.reset();
-    int dit_rc = dit_ggml_generate(&ctx->dit, s.noise.data(), s.context.data(), s.enc_hidden.data(), s.enc_S, s.T,
-                                   batch_n, s.num_steps, s.schedule.data(), s.output.data(), s.guidance_scale, &s.dbg,
-                                   s.context_silence.empty() ? nullptr : s.context_silence.data(), s.cover_steps,
-                                   cancel, cancel_data, s.per_S.data(), s.per_enc_S.data(),
-                                   s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
-                                   s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(),
-                                   s.repaint_src.empty() ? nullptr : s.repaint_src.data(), s.repaint_t0, s.repaint_t1,
-                                   s.repaint_injection_ratio, s.repaint_crossfade_frames, s.use_sde, s.seeds.data());
+    int dit_rc = dit_ggml_generate(
+        dit, s.noise.data(), s.context.data(), s.enc_hidden.data(), s.enc_S, s.T, batch_n, s.num_steps,
+        s.schedule.data(), s.output.data(), s.guidance_scale, &s.dbg,
+        s.context_silence.empty() ? nullptr : s.context_silence.data(), s.cover_steps, cancel, cancel_data,
+        s.per_S.data(), s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
+        s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(), s.seeds.data(), ctx->params.use_batch_cfg,
+        s.rr.dcw_scaler, s.rr.dcw_high_scaler, s.rr.dcw_mode.c_str(), s.rr.solver.c_str(), s.rr.stork_substeps);
     if (dit_rc != 0) {
         return -1;
     }
     fprintf(stderr, "[DiT-Generate] Total: %.1f ms (%.1f ms/sample)\n", s.timer.ms(), s.timer.ms() / batch_n);
 
+    // Latent post-processing before VAE decode: pred = pred * rescale + shift.
+    // Skipped at defaults (1.0 / 0.0).
+    if (s.rr.latent_rescale != 1.0f || s.rr.latent_shift != 0.0f) {
+        fprintf(stderr, "[DiT-Generate] Latent post: shift=%.3f rescale=%.3f\n", s.rr.latent_shift,
+                s.rr.latent_rescale);
+        const int n = (int) s.output.size();
+        for (int i = 0; i < n; i++) {
+            s.output[i] = s.output[i] * s.rr.latent_rescale + s.rr.latent_shift;
+        }
+    }
+
     debug_dump_2d(&s.dbg, "dit_output", s.output.data(), s.T, s.Oc);
     return 0;
 }
 
-// ops_vae_decode_and_splice
-int ops_vae_decode_and_splice(AceSynth *    ctx,
-                              int           batch_n,
-                              AceAudio *    out,
-                              SynthState &  s,
-                              const float * src_audio,
-                              int           src_len,
-                              bool (*cancel)(void *),
-                              void * cancel_data) {
-    // VAE Decode
-    if (!ctx->have_vae) {
+int ops_vae_decode(const AceSynth * ctx,
+                   int              batch_n,
+                   AceAudio *       out,
+                   SynthState &     s,
+                   bool (*cancel)(void *),
+                   void * cancel_data) {
+    VAEGGML * vae = store_require_vae_dec(ctx->store, ctx->vae_dec_key);
+    if (!vae) {
+        fprintf(stderr, "[VAE-Decode] FATAL: store_require_vae_dec failed\n");
+        return -1;
+    }
+    ModelHandle vae_guard(ctx->store, vae);
+
+    // Latent splice for repaint/lego: keep s.output inside [t0, t1), copy
+    // s.cover_latents outside. Hard cut at frame boundary, the VAE tiled
+    // decoder smooths the seam in the waveform.
+    bool have_region = s.is_repaint || s.is_lego_region;
+    if (have_region && s.have_cover && s.T_cover > 0) {
+        int copy_T = s.T_cover < s.T ? s.T_cover : s.T;
         for (int b = 0; b < batch_n; b++) {
+            float * dst = s.output.data() + (size_t) b * s.Oc * s.T;
+            for (int t = 0; t < copy_T; t++) {
+                if (t < s.repaint_t0 || t >= s.repaint_t1) {
+                    memcpy(dst + (size_t) t * 64, s.cover_latents.data() + (size_t) t * 64, 64 * sizeof(float));
+                }
+            }
+        }
+        fprintf(stderr, "[Latent-Splice] kept generated frames [%d, %d) / %d, source elsewhere\n", s.repaint_t0,
+                s.repaint_t1, s.T);
+    }
+
+    int                T_latent    = s.T;
+    int                T_audio_max = T_latent * 1920;
+    std::vector<float> audio(2 * T_audio_max);
+
+    for (int b = 0; b < batch_n; b++) {
+        float * dit_out = s.output.data() + b * s.Oc * s.T;
+
+        s.timer.reset();
+        int T_audio = vae_ggml_decode_tiled(vae, dit_out, T_latent, audio.data(), T_audio_max, ctx->params.vae_chunk,
+                                            ctx->params.vae_overlap, cancel, cancel_data);
+        if (T_audio < 0) {
+            if (cancel && cancel(cancel_data)) {
+                fprintf(stderr, "[VAE-Decode Batch%d] Cancelled\n", b);
+                return -1;
+            }
+            fprintf(stderr, "[VAE-Decode Batch%d] ERROR: decode failed\n", b);
             out[b].samples     = NULL;
             out[b].n_samples   = 0;
             out[b].sample_rate = 48000;
+            continue;
         }
-        return 0;
-    }
+        fprintf(stderr, "[VAE-Decode Batch%d] Decode: %.1f ms\n", b, s.timer.ms());
 
-    {
-        int                T_latent    = s.T;
-        int                T_audio_max = T_latent * 1920;
-        std::vector<float> audio(2 * T_audio_max);
+        if (b == 0) {
+            debug_dump_2d(&s.dbg, "vae_audio", audio.data(), 2, T_audio);
+        }
 
-        for (int b = 0; b < batch_n; b++) {
-            float * dit_out = s.output.data() + b * s.Oc * s.T;
-
-            s.timer.reset();
-            int T_audio = vae_ggml_decode_tiled(&ctx->vae, dit_out, T_latent, audio.data(), T_audio_max,
-                                                ctx->params.vae_chunk, ctx->params.vae_overlap, cancel, cancel_data);
-            if (T_audio < 0) {
-                // check if this was a cancellation or a real error
-                if (cancel && cancel(cancel_data)) {
-                    fprintf(stderr, "[VAE-Decode Batch%d] Cancelled\n", b);
-                    return -1;
-                }
-                fprintf(stderr, "[VAE-Decode Batch%d] ERROR: decode failed\n", b);
-                out[b].samples     = NULL;
-                out[b].n_samples   = 0;
-                out[b].sample_rate = 48000;
-                continue;
-            }
-            fprintf(stderr, "[VAE-Decode Batch%d] Decode: %.1f ms\n", b, s.timer.ms());
-
-            if (b == 0) {
-                debug_dump_2d(&s.dbg, "vae_audio", audio.data(), 2, T_audio);
-            }
-
-            // Copy to s.output buffer
-            int n_total    = 2 * T_audio;
-            out[b].samples = (float *) malloc((size_t) n_total * sizeof(float));
-            memcpy(out[b].samples, audio.data(), (size_t) n_total * sizeof(float));
-            out[b].n_samples   = T_audio;
+        int n_total    = 2 * T_audio;
+        out[b].samples = (float *) malloc((size_t) n_total * sizeof(float));
+        if (!out[b].samples) {
+            fprintf(stderr, "[VAE-Decode Batch%d] ERROR: OOM allocating output (%d samples)\n", b, n_total);
+            out[b].n_samples   = 0;
             out[b].sample_rate = 48000;
+            continue;
+        }
+        memcpy(out[b].samples, audio.data(), (size_t) n_total * sizeof(float));
+        out[b].n_samples   = T_audio;
+        out[b].sample_rate = 48000;
 
-            // Waveform splice: replace non-repaint regions with original source audio.
-            // Python: apply_repaint_waveform_splice (when mode != aggressive)
-            // mask[s] = 1.0 inside repaint region, 0.0 outside, linear ramp at edges.
-            // result = mask * pred + (1-mask) * src  [planar stereo: L:s.T, R:s.T]
-            bool have_repaint_region = s.is_repaint || s.is_lego_region;
-            if (have_repaint_region && src_audio) {  // always splice (non-aggressive)
-                int T_splice = out[b].n_samples < src_len ? out[b].n_samples : src_len;
-                int start_s  = (int) (s.rs * 48000.0f);
-                int end_s    = (int) (s.re * 48000.0f);
-                start_s      = start_s < 0 ? 0 : (start_s > T_splice ? T_splice : start_s);
-                end_s        = end_s < start_s ? start_s : (end_s > T_splice ? T_splice : end_s);
-                // skip splice if region covers everything
-                if (start_s > 0 || end_s < T_splice) {
-                    int cf_s       = (int) (s.repaint_wav_cf_sec * 48000.0f);
-                    int fade_start = start_s - cf_s > 0 ? start_s - cf_s : 0;
-                    int fade_end   = end_s + cf_s < T_splice ? end_s + cf_s : T_splice;
-                    for (int ch = 0; ch < 2; ch++) {
-                        float * pred = out[b].samples + (size_t) ch * out[b].n_samples;
-                        // src_audio is interleaved [L0,R0,L1,R1,...]: access via s*2+ch
-                        for (int si = 0; si < fade_start; si++) {
-                            pred[si] = src_audio[(size_t) si * 2 + ch];
-                        }
-                        for (int si = fade_start; si < start_s; si++) {
-                            // left ramp: 0->1 toward repaint zone (excl endpoints)
-                            int   rl  = start_s - fade_start;
-                            float m   = (float) (si - fade_start + 1) / (float) (rl + 1);
-                            float src = src_audio[(size_t) si * 2 + ch];
-                            pred[si]  = m * pred[si] + (1.0f - m) * src;
-                        }
-                        // [start_s, end_s): keep generated s.output as-is (mask=1)
-                        for (int si = end_s; si < fade_end; si++) {
-                            // right ramp: 1->0 away from repaint zone (excl endpoints)
-                            int   rl  = fade_end - end_s;
-                            float m   = (float) (fade_end - si) / (float) (rl + 1);
-                            float src = src_audio[(size_t) si * 2 + ch];
-                            pred[si]  = m * pred[si] + (1.0f - m) * src;
-                        }
-                        for (int si = fade_end; si < T_splice; si++) {
-                            pred[si] = src_audio[(size_t) si * 2 + ch];
-                        }
-                    }
-                    fprintf(stderr, "[WAV-Splice Batch%d] wav splice %.1fs-%.1fs cf=%.0fms\n", b, s.rs, s.re,
-                            s.repaint_wav_cf_sec * 1000.0f);
+        // Waveform hard splice (audio path only): replace out-of-zone samples
+        // with the original source PCM. The VAE roundtrip is lossy, so this
+        // restores bit-exact fidelity outside the region. Skipped on the
+        // latent path (no original waveform available, single VAE decode is
+        // already the cleanest output we can produce).
+        if (have_region && !s.padded_src.empty()) {
+            int       T_src   = (int) (s.padded_src.size() / 2);
+            const int start_s = (int) ((size_t) s.repaint_t0 * 1920);
+            const int end_s   = (int) ((size_t) s.repaint_t1 * 1920);
+            const int T_clip  = T_audio < T_src ? T_audio : T_src;
+            for (int ch = 0; ch < 2; ch++) {
+                float * pred = out[b].samples + (size_t) ch * T_audio;
+                for (int si = 0; si < start_s && si < T_clip; si++) {
+                    pred[si] = s.padded_src[(size_t) si * 2 + ch];
+                }
+                for (int si = end_s; si < T_clip; si++) {
+                    pred[si] = s.padded_src[(size_t) si * 2 + ch];
                 }
             }
+            fprintf(stderr, "[WAV-Splice Batch%d] hard splice samples [%d, %d) / %d\n", b, start_s, end_s, T_clip);
         }
     }
     return 0;

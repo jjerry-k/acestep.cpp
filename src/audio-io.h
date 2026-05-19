@@ -5,6 +5,8 @@
 // All functions use planar stereo float: [L: T samples][R: T samples].
 // Part of acestep.cpp. MIT license.
 
+#include "task-types.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -126,8 +128,14 @@ static float * audio_io_read_mp3_buf(const uint8_t * data, size_t size, int * T_
             }
             int need = pcm_count + samples * out_nch;
             if (need > pcm_cap) {
-                pcm_cap = (need < 65536) ? 65536 : need * 2;
-                pcm_buf = (short *) realloc(pcm_buf, (size_t) pcm_cap * sizeof(short));
+                pcm_cap         = (need < 65536) ? 65536 : need * 2;
+                short * new_buf = (short *) realloc(pcm_buf, (size_t) pcm_cap * sizeof(short));
+                if (!new_buf) {
+                    fprintf(stderr, "[Audio] OOM while decoding MP3 frames\n");
+                    free(pcm_buf);
+                    return NULL;
+                }
+                pcm_buf = new_buf;
             }
             memcpy(pcm_buf + pcm_count, pcm, (size_t) samples * (size_t) out_nch * sizeof(short));
             pcm_count += samples * out_nch;
@@ -345,9 +353,13 @@ static void audio_normalize(float * audio, int n_total, int peak_clip = 10) {
 }
 
 // convert planar [L:T][R:T] to interleaved [L0,R0,L1,R1,...].
-// returns malloc'd buffer of 2*T floats. caller must free().
+// returns malloc'd buffer of 2*T floats. caller must free(). returns NULL on OOM.
 static float * audio_planar_to_interleaved(const float * planar, int T) {
     float * out = (float *) malloc((size_t) T * 2 * sizeof(float));
+    if (!out) {
+        fprintf(stderr, "[Audio] OOM allocating interleaved buffer for %d samples\n", T);
+        return NULL;
+    }
     for (int t = 0; t < T; t++) {
         out[t * 2 + 0] = planar[t];
         out[t * 2 + 1] = planar[T + t];
@@ -355,70 +367,197 @@ static float * audio_planar_to_interleaved(const float * planar, int T) {
     return out;
 }
 
-// audio_encode_wav is the core: encode planar stereo to WAV 16-bit PCM in memory.
-// 44-byte RIFF header + interleaved int16 samples.
-// audio is planar [L0..LN, R0..RN], pre-normalized by caller.
-// Does NOT normalize - caller is responsible (audio_write does it).
-// Returns empty string on failure.
-static std::string audio_encode_wav(const float * audio, int T_audio, int sr) {
-    int n_channels = 2, bits = 16;
-    int byte_rate   = sr * n_channels * (bits / 8);
-    int block_align = n_channels * (bits / 8);
-    int data_size   = T_audio * n_channels * (bits / 8);
-    int file_size   = 36 + data_size;
+// WAV output format
+enum WavFormat {
+    WAV_S16,  // 16-bit signed integer PCM (classic RIFF, default)
+    WAV_S24,  // 24-bit signed integer PCM (classic RIFF)
+    WAV_F32,  // 32-bit IEEE 754 float (classic RIFF, fmt_tag=3)
+};
+
+// Parse the JSON output_format string into container type and WAV subformat.
+// Accepts: mp3, wav16, wav24, wav32. Returns false on unknown format.
+// Also accepts NULL and "mp3" as default (is_mp3 = true).
+static bool audio_parse_format(const char * s, bool & is_mp3, WavFormat & wav_fmt) {
+    if (!s || !strcmp(s, OUTPUT_FORMAT_MP3)) {
+        is_mp3 = true;
+        return true;
+    }
+    if (!strcmp(s, OUTPUT_FORMAT_WAV16)) {
+        is_mp3  = false;
+        wav_fmt = WAV_S16;
+        return true;
+    }
+    if (!strcmp(s, OUTPUT_FORMAT_WAV24)) {
+        is_mp3  = false;
+        wav_fmt = WAV_S24;
+        return true;
+    }
+    if (!strcmp(s, OUTPUT_FORMAT_WAV32)) {
+        is_mp3  = false;
+        wav_fmt = WAV_F32;
+        return true;
+    }
+    return false;
+}
+
+// Byte-level write helpers (endian-safe)
+
+static void wav_write_u16le(char *& p, uint16_t x) {
+    *p++ = (char) (x & 0xff);
+    *p++ = (char) ((x >> 8) & 0xff);
+}
+
+static void wav_write_u24le(char *& p, uint32_t x) {
+    *p++ = (char) (x & 0xff);
+    *p++ = (char) ((x >> 8) & 0xff);
+    *p++ = (char) ((x >> 16) & 0xff);
+}
+
+static void wav_write_u32le(char *& p, uint32_t x) {
+    *p++ = (char) (x & 0xff);
+    *p++ = (char) ((x >> 8) & 0xff);
+    *p++ = (char) ((x >> 16) & 0xff);
+    *p++ = (char) ((x >> 24) & 0xff);
+}
+
+static float wav_clamp1(float x) {
+    return x < -1.0f ? -1.0f : (x > 1.0f ? 1.0f : x);
+}
+
+static float wav_sanitize(float x) {
+    return std::isfinite(x) ? x : 0.0f;
+}
+
+// Classic RIFF header: fmt_tag 1 (PCM int) or 3 (IEEE float), 16-byte fmt chunk
+static void wav_write_header_basic(char *& p, int T_audio, int sr, int n_channels, int bits, uint16_t fmt_tag) {
+    uint32_t bytes_per_sample = (uint32_t) bits / 8;
+    uint32_t byte_rate        = (uint32_t) sr * (uint32_t) n_channels * bytes_per_sample;
+    uint16_t block_align      = (uint16_t) (n_channels * (int) bytes_per_sample);
+    uint32_t data_size        = (uint32_t) T_audio * (uint32_t) n_channels * bytes_per_sample;
+    uint32_t file_size        = 36 + data_size;
+
+    memcpy(p, "RIFF", 4);
+    p += 4;
+    wav_write_u32le(p, file_size);
+    memcpy(p, "WAVE", 4);
+    p += 4;
+
+    memcpy(p, "fmt ", 4);
+    p += 4;
+    wav_write_u32le(p, 16);
+    wav_write_u16le(p, fmt_tag);
+    wav_write_u16le(p, (uint16_t) n_channels);
+    wav_write_u32le(p, (uint32_t) sr);
+    wav_write_u32le(p, byte_rate);
+    wav_write_u16le(p, block_align);
+    wav_write_u16le(p, (uint16_t) bits);
+
+    memcpy(p, "data", 4);
+    p += 4;
+    wav_write_u32le(p, data_size);
+}
+
+// Encode planar stereo to WAV 16-bit signed integer PCM in memory.
+// 44-byte classic RIFF header (fmt_tag=1) + interleaved int16 samples.
+// Clamps to [-1, +1], coerces NaN/Inf to zero.
+static std::string audio_encode_wav_s16(const float * audio, int T_audio, int sr) {
+    int n_channels = 2;
+    int data_size  = T_audio * n_channels * 2;
 
     std::string out;
     out.resize(44 + (size_t) data_size);
     char * p = &out[0];
 
-    // RIFF header
-    memcpy(p, "RIFF", 4);
-    p += 4;
-    memcpy(p, &file_size, 4);
-    p += 4;
-    memcpy(p, "WAVE", 4);
-    p += 4;
-    memcpy(p, "fmt ", 4);
-    p += 4;
-    int   fmt_size = 16;
-    short fmt_tag  = 1;
-    short nc       = (short) n_channels;
-    short ba       = (short) block_align;
-    short bp       = (short) bits;
-    memcpy(p, &fmt_size, 4);
-    p += 4;
-    memcpy(p, &fmt_tag, 2);
-    p += 2;
-    memcpy(p, &nc, 2);
-    p += 2;
-    memcpy(p, &sr, 4);
-    p += 4;
-    memcpy(p, &byte_rate, 4);
-    p += 4;
-    memcpy(p, &ba, 2);
-    p += 2;
-    memcpy(p, &bp, 2);
-    p += 2;
-    memcpy(p, "data", 4);
-    p += 4;
-    memcpy(p, &data_size, 4);
-    p += 4;
+    wav_write_header_basic(p, T_audio, sr, n_channels, 16, 1);
 
-    // interleave planar float to PCM int16
-    const float * L   = audio;
-    const float * R   = audio + T_audio;
-    short *       pcm = (short *) p;
+    const float * L = audio;
+    const float * R = audio + T_audio;
+
     for (int t = 0; t < T_audio; t++) {
-        pcm[t * 2 + 0] = (short) (L[t] * 32767.0f);
-        pcm[t * 2 + 1] = (short) (R[t] * 32767.0f);
+        int16_t l = (int16_t) (wav_clamp1(wav_sanitize(L[t])) * 32767.0f);
+        int16_t r = (int16_t) (wav_clamp1(wav_sanitize(R[t])) * 32767.0f);
+        wav_write_u16le(p, (uint16_t) l);
+        wav_write_u16le(p, (uint16_t) r);
     }
 
     return out;
 }
 
+// Encode planar stereo to WAV 24-bit signed integer PCM in memory.
+// 44-byte classic RIFF header (fmt_tag=1) + interleaved int24 samples.
+// Clamps to [-1, +1], coerces NaN/Inf to zero.
+static std::string audio_encode_wav_s24(const float * audio, int T_audio, int sr) {
+    int n_channels = 2;
+    int data_size  = T_audio * n_channels * 3;
+
+    std::string out;
+    out.resize(44 + (size_t) data_size);
+    char * p = &out[0];
+
+    wav_write_header_basic(p, T_audio, sr, n_channels, 24, 1);
+
+    const float * L = audio;
+    const float * R = audio + T_audio;
+
+    for (int t = 0; t < T_audio; t++) {
+        int32_t l = (int32_t) (wav_clamp1(wav_sanitize(L[t])) * 8388607.0f);
+        int32_t r = (int32_t) (wav_clamp1(wav_sanitize(R[t])) * 8388607.0f);
+        wav_write_u24le(p, (uint32_t) l);
+        wav_write_u24le(p, (uint32_t) r);
+    }
+
+    return out;
+}
+
+// Encode planar stereo to WAV 32-bit IEEE 754 float in memory.
+// 44-byte classic RIFF header (fmt_tag=3) + interleaved float32 samples.
+// Coerces NaN/Inf to zero. No clamping: output may exceed [-1, +1].
+static std::string audio_encode_wav_f32(const float * audio, int T_audio, int sr) {
+    int n_channels = 2;
+    int data_size  = T_audio * n_channels * 4;
+
+    std::string out;
+    out.resize(44 + (size_t) data_size);
+    char * p = &out[0];
+
+    wav_write_header_basic(p, T_audio, sr, n_channels, 32, 3);
+
+    const float * L = audio;
+    const float * R = audio + T_audio;
+
+    for (int t = 0; t < T_audio; t++) {
+        float    lf = wav_sanitize(L[t]);
+        float    rf = wav_sanitize(R[t]);
+        uint32_t lu, ru;
+        memcpy(&lu, &lf, 4);
+        memcpy(&ru, &rf, 4);
+        wav_write_u32le(p, lu);
+        wav_write_u32le(p, ru);
+    }
+
+    return out;
+}
+
+// Encode planar stereo to WAV in memory in the requested format.
+// audio is planar [L0..LN, R0..RN], pre-normalized by caller.
+// Does NOT normalize: caller is responsible (audio_write does it).
+// NaN and Inf are coerced to zero. S16/S24 clamp to [-1, +1].
+// Returns empty string on failure.
+static std::string audio_encode_wav(const float * audio, int T_audio, int sr, WavFormat fmt = WAV_S16) {
+    switch (fmt) {
+        case WAV_S16:
+            return audio_encode_wav_s16(audio, T_audio, sr);
+        case WAV_S24:
+            return audio_encode_wav_s24(audio, T_audio, sr);
+        case WAV_F32:
+            return audio_encode_wav_f32(audio, T_audio, sr);
+    }
+    return audio_encode_wav_s16(audio, T_audio, sr);
+}
+
 // Write planar stereo audio to WAV file. Thin wrapper around audio_encode_wav.
-static bool audio_write_wav(const char * path, const float * audio, int T_audio, int sr) {
-    std::string wav = audio_encode_wav(audio, T_audio, sr);
+static bool audio_write_wav(const char * path, const float * audio, int T_audio, int sr, WavFormat fmt = WAV_S16) {
+    std::string wav = audio_encode_wav(audio, T_audio, sr, fmt);
     if (wav.empty()) {
         return false;
     }
@@ -545,6 +684,11 @@ static std::string audio_encode_mp3(const float * audio,
                 int warm_start = chunk_start - warm_len;
 
                 float * buf = (float *) malloc((size_t) warm_len * 2 * sizeof(float));
+                if (!buf) {
+                    fprintf(stderr, "[MP3] OOM allocating warmup buffer, skipping tid=%d\n", tid);
+                    mp3enc_free(e);
+                    return;
+                }
                 memcpy(buf, enc_audio + warm_start, (size_t) warm_len * sizeof(float));
                 memcpy(buf + warm_len, enc_audio + enc_T + warm_start, (size_t) warm_len * sizeof(float));
 
@@ -571,6 +715,10 @@ static std::string audio_encode_mp3(const float * audio,
             int len = (p + sub <= chunk_len) ? sub : (chunk_len - p);
 
             float * buf = (float *) malloc((size_t) len * 2 * sizeof(float));
+            if (!buf) {
+                fprintf(stderr, "[MP3] OOM allocating chunk buffer tid=%d, aborting this chunk\n", tid);
+                break;
+            }
             memcpy(buf, enc_audio + chunk_start + p, (size_t) len * sizeof(float));
             memcpy(buf + len, enc_audio + enc_T + chunk_start + p, (size_t) len * sizeof(float));
 
@@ -647,15 +795,24 @@ static bool audio_write_mp3(const char * path, const float * audio, int T_audio,
     return true;
 }
 
-// Write audio, auto-detect format from extension.
+// Write audio, auto-detect container from extension.
 // .mp3 -> MP3 encoding at the given kbps (default 128).
-// .wav (or anything else) -> WAV 16-bit PCM.
-// Normalizes in place before writing (single normalization point).
-static bool audio_write(const char * path, float * audio, int T_audio, int sr, int kbps, int peak_clip = 10) {
-    audio_normalize(audio, T_audio * 2, peak_clip);
+// .wav (or anything else) -> WAV in the requested format.
+// Normalizes in place before writing, except WAV_F32 (preserves full range).
+static bool audio_write(const char * path,
+                        float *      audio,
+                        int          T_audio,
+                        int          sr,
+                        int          kbps,
+                        WavFormat    wav_fmt   = WAV_S16,
+                        int          peak_clip = 10) {
+    bool skip_norm = (wav_fmt == WAV_F32 && !audio_io_ends_with(path, ".mp3"));
+    if (!skip_norm) {
+        audio_normalize(audio, T_audio * 2, peak_clip);
+    }
 
     if (audio_io_ends_with(path, ".mp3")) {
         return audio_write_mp3(path, audio, T_audio, sr, (kbps > 0) ? kbps : 128);
     }
-    return audio_write_wav(path, audio, T_audio, sr);
+    return audio_write_wav(path, audio, T_audio, sr, wav_fmt);
 }

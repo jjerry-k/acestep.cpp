@@ -17,7 +17,7 @@ https://huggingface.co/Serveurperso/ACE-Step-1.5-GGUF/tree/main
 | LM | acestep-5Hz-lm-4B-Q8_0.gguf | 4.2 GB |
 | Text encoder | Qwen3-Embedding-0.6B-Q8_0.gguf | 748 MB |
 | DiT | acestep-v15-turbo-Q8_0.gguf | 2.4 GB |
-| VAE | vae-BF16.gguf (always this one) | 322 MB |
+| VAE | vae-BF16.gguf | 322 MB |
 
 Three LM sizes available: 0.6B (fast), 1.7B, 4B (best quality).
 Multiple DiT variants: turbo (8 steps), sft (50 steps, higher quality), base, shift1, shift3, continuous.
@@ -50,10 +50,11 @@ buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 ### Linux / macOS
 
 ```bash
-./buildcuda.sh    # NVIDIA GPU
-./buildvulkan.sh  # AMD/Intel GPU (Vulkan)
-./buildcpu.sh     # CPU only (with BLAS)
-./buildall.sh     # all backends (CUDA + Vulkan + CPU, runtime loading)
+./buildcuda.sh                   # NVIDIA GPU
+./buildvulkan.sh                 # AMD/Intel GPU (Vulkan)
+./buildcpu.sh                    # CPU only (with BLAS)
+./buildall.sh                    # all backends (CUDA + Vulkan + CPU, runtime loading)
+NVCC_CCBIN=g++-13 ./buildcuda.sh # rolling release distros (Arch w/ GCC 16, etc.)
 ```
 
 macOS auto-enables Metal and Accelerate BLAS with any of the above.
@@ -71,36 +72,72 @@ write a caption, set lyrics and metadata, generate, play, and download tracks.
 Models are loaded on first request (zero GPU at startup) and swapped
 automatically when you pick a different one in the UI.
 
-## LoRA
+## Adapters
 
-Drop LoRA adapters in the `loras/` folder and restart the server.
-Supports PEFT directories and ComfyUI single `.safetensors` files.
-Select the active LoRA from the WebUI.
+Drop adapters in the `adapters/` folder and restart the server.
+Supports LoRA today in two flavours: PEFT directories (with
+`adapter_model.safetensors` + `adapter_config.json`) and ComfyUI single
+`.safetensors` files. Select the active adapter from the WebUI.
 
 ## Server options
 
 ```
---models <dir>       Model directory (required)
---loras <dir>        LoRA adapters directory
---host <addr>        Listen address (default: 127.0.0.1)
---port <N>           Listen port (default: 8080)
---max-batch <N>      LM batch limit 1-9 (default: 1)
---vae-chunk <N>      VAE tile size (default: 256, lower = less VRAM)
---mp3-bitrate <N>    MP3 kbps (default: 128)
+Usage: ./ace-server --models <dir> [options]
+
+Required:
+  --models <dir>          Directory of GGUF model files
+
+Adapter:
+  --adapters <dir>        Directory of adapters
+
+Memory control:
+  --keep-loaded           Keep models in VRAM between requests
+  --vae-chunk <N>         Latent frames per tile (default: 1024)
+  --vae-overlap <N>       Overlap frames per side (default: 64)
+
+Output:
+  --mp3-bitrate <kbps>    MP3 bitrate (default: 128)
+
+Server:
+  --host <addr>           Listen address (default: 127.0.0.1)
+  --port <N>              Listen port (default: 8080)
+  --max-batch <N>         LM batch limit (default: 1)
+  --max-seq <N>           KV cache size (default: 8192)
+
+Debug:
+  --no-fsm                Disable FSM constrained decoding
+  --no-fa                 Disable flash attention
+  --no-batch-cfg          Split CFG into two separate forwards (LM + DiT)
+  --clamp-fp16            Clamp hidden states to FP16 range
 ```
 
 <details>
 <summary>API endpoints</summary>
 
-The server exposes three POST endpoints and two GET endpoints:
+The server exposes four POST endpoints and two GET endpoints:
 
 **POST /lm** - Generate lyrics and audio codes from a caption. Returns JSON.
 
-**POST /synth** - Render audio codes into MP3 or WAV (`?wav=1`).
-Accepts JSON or multipart (with source audio for cover/repaint modes).
+**POST /synth** - Render audio codes into MP3 or WAV (selected by the
+`output_format` field in the request JSON). Accepts JSON or multipart
+(with source audio or pre-encoded latents for cover/repaint modes; latents
+win over audio when both are sent on the same side).
 
 **POST /understand** - Reverse pipeline: audio in, metadata + lyrics + codes out.
-Accepts multipart (audio file) or JSON (codes-only).
+Multipart only (source audio or pre-encoded latents required, optional request JSON for params).
+
+**POST /vae** - Standalone VAE entrypoint: send `audio` to encode (latents
+out), send `src_latents` to decode (audio out). Multipart only, the two
+inputs are mutually exclusive. Lets the webui cache a latent on an
+existing card, or play back a .vae file, without paying the LM cost of a
+full /synth or /understand pass.
+
+Synth responses are multipart/mixed: one audio part and one latent part per
+generated track, paired in wire order. Understand responses are
+multipart/mixed too: one JSON part plus the latent of the input source
+audio. The client can replay any captured latent back as `src_latents` /
+`ref_latents` on a later /synth or /understand call to skip the VAE encode
+entirely, or feed it to /vae decode to reproduce the matching audio.
 
 **GET /health** - Returns `{"status":"ok"}`.
 
@@ -119,15 +156,13 @@ For scripting without the server, `ace-lm` and `ace-synth` work as a pipe:
 ```bash
 # LM generates lyrics + codes
 ./build/ace-lm \
-    --request /tmp/request.json \
-    --lm models/acestep-5Hz-lm-4B-Q8_0.gguf
+    --models models \
+    --request /tmp/request.json
 
 # DiT + VAE render to audio
 ./build/ace-synth \
-    --request /tmp/request0.json \
-    --embedding models/Qwen3-Embedding-0.6B-Q8_0.gguf \
-    --dit models/acestep-v15-turbo-Q8_0.gguf \
-    --vae models/vae-BF16.gguf
+    --models models \
+    --request /tmp/request0.json
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full JSON reference,
@@ -149,11 +184,12 @@ internals.
 - [A Musician's Guide](https://github.com/ace-step/ACE-Step-1.5/discussions/235) - non-technical guide for music makers
 - [Tutorial](https://github.com/ace-step/ACE-Step-1.5/blob/main/docs/en/Tutorial.md) - design philosophy, model architecture, input control, inference hyperparameters
 
-### Third-party UIs for acestep.cpp
+### Third-party projects
 
 - [acestep-cpp-ui](https://github.com/audiohacking/acestep-cpp-ui)
 - [acestep.cpp-simple-GUI](https://github.com/Nurb4000/acestep.cpp-simple-GUI)
 - [aceradio](https://github.com/IMbackK/aceradio)
+- [HOT-Step-CPP](https://github.com/scragnog/HOT-Step-CPP) (experimental fork with additional solvers and sampling modes)
 
 ## Samples
 

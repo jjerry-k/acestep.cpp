@@ -1,14 +1,14 @@
 #pragma once
-// model-registry.h: scan directories for GGUF models and LoRA adapters.
+// model-registry.h: scan directories for GGUF models and adapters.
 //
 // Reads only GGUF headers (no weight data) to classify each file by its
 // general.architecture KV into lm/dit/text-enc/vae buckets.
-// LoRA entries are .safetensors files or PEFT directories.
+// Adapter entries are .safetensors files or PEFT directories.
 //
 // Usage:
 //   ModelRegistry reg;
 //   registry_scan(&reg, "./models");
-//   registry_scan_loras(&reg, "./loras");
+//   registry_scan_adapters(&reg, "./adapters");
 //   const ModelEntry * dit = registry_find(reg.dit, "acestep-v15-turbo-Q8_0.gguf");
 
 #include "gguf.h"
@@ -34,17 +34,17 @@ struct ModelEntry {
     std::string path;  // full path
 };
 
-struct LoraEntry {
-    std::string name;  // filename or directory name (e.g. "singer.safetensors" or "my-lora")
+struct AdapterEntry {
+    std::string name;  // filename or directory name (e.g. "singer.safetensors" or "my-adapter")
     std::string path;  // full path (file or PEFT directory)
 };
 
 struct ModelRegistry {
-    std::vector<ModelEntry> lm;
-    std::vector<ModelEntry> dit;
-    std::vector<ModelEntry> text_enc;
-    std::vector<ModelEntry> vae;
-    std::vector<LoraEntry>  loras;
+    std::vector<ModelEntry>   lm;
+    std::vector<ModelEntry>   dit;
+    std::vector<ModelEntry>   text_enc;
+    std::vector<ModelEntry>   vae;
+    std::vector<AdapterEntry> adapters;
 };
 
 // find an entry by name in a bucket. returns NULL if not found.
@@ -57,9 +57,9 @@ static const ModelEntry * registry_find(const std::vector<ModelEntry> & bucket, 
     return nullptr;
 }
 
-// find a lora entry by name. returns NULL if not found.
-static const LoraEntry * registry_find_lora(const ModelRegistry & reg, const char * name) {
-    for (const auto & e : reg.loras) {
+// find an adapter entry by name. returns NULL if not found.
+static const AdapterEntry * registry_find_adapter(const ModelRegistry & reg, const char * name) {
+    for (const auto & e : reg.adapters) {
         if (e.name == name) {
             return &e;
         }
@@ -237,38 +237,38 @@ static bool registry_scan(ModelRegistry * reg, const char * models_dir) {
     return count > 0;
 }
 
-// scan a directory for LoRA adapters.
+// scan a directory for adapters.
 // - .safetensors files: ComfyUI single-file format (alpha baked in)
 // - subdirectories containing adapter_model.safetensors: PEFT format
-// returns true if at least one lora was found.
-static bool registry_scan_loras(ModelRegistry * reg, const char * loras_dir) {
+// returns true if at least one adapter was found.
+static bool registry_scan_adapters(ModelRegistry * reg, const char * adapters_dir) {
     int count = 0;
 
     // single .safetensors files
     std::vector<std::string> files;
-    registry_list_dir(loras_dir, &files);
+    registry_list_dir(adapters_dir, &files);
     std::sort(files.begin(), files.end());
     for (const auto & fname : files) {
         if (!str_ends_with(fname, ".safetensors")) {
             continue;
         }
-        std::string full = std::string(loras_dir) + REGISTRY_SEP + fname;
-        reg->loras.push_back({ fname, full });
-        fprintf(stderr, "[Registry] LoRA: %s (ComfyUI)\n", fname.c_str());
+        std::string full = std::string(adapters_dir) + REGISTRY_SEP + fname;
+        reg->adapters.push_back({ fname, full });
+        fprintf(stderr, "[Registry] Adapter: %s (ComfyUI)\n", fname.c_str());
         count++;
     }
 
     // PEFT directories (contain adapter_model.safetensors)
     std::vector<std::string> subdirs;
-    registry_list_subdirs(loras_dir, &subdirs);
+    registry_list_subdirs(adapters_dir, &subdirs);
     std::sort(subdirs.begin(), subdirs.end());
     for (const auto & dname : subdirs) {
         std::string adapter =
-            std::string(loras_dir) + REGISTRY_SEP + dname + REGISTRY_SEP + "adapter_model.safetensors";
+            std::string(adapters_dir) + REGISTRY_SEP + dname + REGISTRY_SEP + "adapter_model.safetensors";
         if (registry_is_file(adapter.c_str())) {
-            std::string full = std::string(loras_dir) + REGISTRY_SEP + dname;
-            reg->loras.push_back({ dname, full });
-            fprintf(stderr, "[Registry] LoRA: %s (PEFT)\n", dname.c_str());
+            std::string full = std::string(adapters_dir) + REGISTRY_SEP + dname;
+            reg->adapters.push_back({ dname, full });
+            fprintf(stderr, "[Registry] Adapter: %s (PEFT)\n", dname.c_str());
             count++;
         }
     }

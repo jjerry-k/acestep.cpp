@@ -10,21 +10,21 @@ Run from tests/ directory:
     ./debug-tok-cossim.py --duration 5     # 5s test audio
     ./debug-tok-cossim.py --wav input.wav  # custom WAV
 """
-import sys, os, subprocess, argparse, struct, shutil, math
+import sys, os, subprocess, argparse, struct, shutil, math, json
 import numpy as np
 
 FSQ_LEVELS = [8, 8, 8, 5, 5, 5]
 
 ACE_BIN = "../build/ace-understand"
-VAE_GGUF = "../models/vae-BF16.gguf"
+MODELS_DIR = "../models"
 
 MODE_CONFIG = {
     "turbo": {
-        "dit_gguf":    "../models/acestep-v15-turbo-BF16.gguf",
+        "dit_model":   "acestep-v15-turbo-BF16.gguf",
         "config_path": "acestep-v15-turbo",
     },
     "sft": {
-        "dit_gguf":    "../models/acestep-v15-sft-BF16.gguf",
+        "dit_model":   "acestep-v15-sft-BF16.gguf",
         "config_path": "acestep-v15-sft",
     },
 }
@@ -64,15 +64,22 @@ def fsq_decode_index(index):
     return dims
 
 
-def run_cpp(wav_path, dit_gguf, dump_dir):
+def run_cpp(wav_path, dit_model, dump_dir):
     """Run ace-understand --dump (tok-only, no LM). Stderr goes to terminal."""
     if os.path.isdir(dump_dir):
         shutil.rmtree(dump_dir)
     os.makedirs(dump_dir)
+
+    # Write a minimal request JSON that selects the DiT variant to test.
+    # ace-understand resolves synth_model through the registry under --models.
+    req_path = os.path.join(dump_dir, "tok-request.json")
+    with open(req_path, "w") as f:
+        json.dump({"synth_model": dit_model, "vae": "vae-BF16.gguf"}, f)
+
     cmd = [ACE_BIN,
+           "--models", MODELS_DIR,
            "--src-audio", wav_path,
-           "--dit", dit_gguf,
-           "--vae", VAE_GGUF,
+           "--request", req_path,
            "--dump", dump_dir]
     print("[GGML] Running ace-understand --dump...")
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
@@ -103,7 +110,7 @@ def main():
 
     # Step 1: C++ (ace-understand --dump)
     dump_dir = "tok-dump"
-    latents, cpp_codes = run_cpp(wav_path, cfg["dit_gguf"], dump_dir)
+    latents, cpp_codes = run_cpp(wav_path, cfg["dit_model"], dump_dir)
     if latents is None:
         return 1
 
