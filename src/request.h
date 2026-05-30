@@ -104,6 +104,13 @@ struct AceRequest {
     std::string scheduler;      // "" -> "linear"
     std::string guidance_mode;  // "" -> "apg"
 
+    // Post-VAE CPU audio post-processing (off by default; output unchanged when off).
+    // denoise: spectral-gating denoiser (self-estimating when no profile).
+    float       denoise_strength;   // 0 = off, (0,1] enables
+    float       denoise_smoothing;  // 0.7
+    float       denoise_mix;        // 0.25
+    bool        spectral_lift;      // false = off (spectral lifter, default params)
+
     // LM mode: "generate" (full: metadata + lyrics + codes),
     // "inspire" (short query -> metadata + lyrics, no codes),
     // "format" (caption + lyrics -> metadata + lyrics, no codes). Default: generate.

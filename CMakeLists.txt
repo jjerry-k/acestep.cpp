@@ -187,4 +187,21 @@ else()
 endif()
 target_link_libraries(mp3-codec PRIVATE Threads::Threads)
 
+# ace-master: reference-based audio mastering (matchering, CPU/pocketfft, no ggml)
+add_executable(ace-master tools/mastering.cpp)
+target_include_directories(ace-master PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor/pocketfft
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+if(MSVC)
+    target_compile_options(ace-master PRIVATE /W4 /wd4100 /wd4505 /wd4244 /wd4267)
+else()
+    target_compile_options(ace-master PRIVATE -Wall -Wextra
+                          -Wno-unused-parameter -Wno-unused-function -Wno-sign-conversion)
+    target_link_libraries(ace-master PRIVATE m)
+endif()
+target_link_libraries(ace-master PRIVATE Threads::Threads)
+
 add_subdirectory(tests)

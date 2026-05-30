@@ -55,6 +55,10 @@ void request_init(AceRequest * r) {
     r->lua_plugins          = false;
     r->scheduler            = "";
     r->guidance_mode        = "";
+    r->denoise_strength     = 0.0f;
+    r->denoise_smoothing    = 0.7f;
+    r->denoise_mix          = 0.25f;
+    r->spectral_lift        = false;
     r->lm_mode              = LM_MODE_NAME_GENERATE;
     r->output_format        = OUTPUT_FORMAT_MP3;
     r->synth_model          = "";
@@ -117,6 +121,18 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "guidance_mode")) && yyjson_is_str(v)) {
         r->guidance_mode = yy_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "denoise_strength")) && yyjson_is_num(v)) {
+        r->denoise_strength = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "denoise_smoothing")) && yyjson_is_num(v)) {
+        r->denoise_smoothing = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "denoise_mix")) && yyjson_is_num(v)) {
+        r->denoise_mix = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "spectral_lift")) && yyjson_is_bool(v)) {
+        r->spectral_lift = yyjson_get_bool(v);
     }
     if ((v = yyjson_obj_get(obj, "custom_timesteps")) && yyjson_is_str(v)) {
         r->custom_timesteps = yy_str(v);
@@ -429,6 +445,18 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     }
     if (all || r->guidance_mode != def.guidance_mode) {
         yyjson_mut_obj_add_str(doc, root, "guidance_mode", r->guidance_mode.c_str());
+    }
+    if (all || r->denoise_strength != def.denoise_strength) {
+        yyjson_mut_obj_add_real(doc, root, "denoise_strength", r->denoise_strength);
+    }
+    if (all || r->denoise_smoothing != def.denoise_smoothing) {
+        yyjson_mut_obj_add_real(doc, root, "denoise_smoothing", r->denoise_smoothing);
+    }
+    if (all || r->denoise_mix != def.denoise_mix) {
+        yyjson_mut_obj_add_real(doc, root, "denoise_mix", r->denoise_mix);
+    }
+    if (all || r->spectral_lift != def.spectral_lift) {
+        yyjson_mut_obj_add_bool(doc, root, "spectral_lift", r->spectral_lift);
     }
     // lm_mode and output_format follow the same rule: enumerations with a
     // guaranteed non-empty value, always explicit in serialized output.
