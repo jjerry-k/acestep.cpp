@@ -339,8 +339,8 @@ static int dit_ggml_generate(DiTGGML *           model,
         solver_plugin = PluginRegistry::instance().solver_lookup(solver_name);
         if (!solver_plugin) {
             fprintf(stderr, "[DiT] WARNING: Lua solver '%s' not found, using C++ path\n", solver_name);
-        } else if (solver_plugin->owns_loop || solver_plugin->needs_model) {
-            fprintf(stderr, "[DiT] WARNING: Lua solver '%s' needs full-loop/model_fn (later phase), using C++ path\n",
+        } else if (solver_plugin->owns_loop) {
+            fprintf(stderr, "[DiT] WARNING: Lua solver '%s' is full-loop (owns_loop), not yet supported, using C++\n",
                     solver_name);
             solver_plugin = nullptr;
         } else {
@@ -386,6 +386,10 @@ static int dit_ggml_generate(DiTGGML *           model,
     solver_state.n_per          = n_per;
     solver_state.stork_substeps = stork_substeps;
 
+    // Snapshot of the current-step velocity, used as the read-only velocity for
+    // multi-eval solvers (whose model_fn overwrites the live vt buffer mid-step).
+    std::vector<float> vt_pre_solver;
+
     // Flow matching loop
     bool switched_cover = false;
     for (int step = 0; step < num_steps; step++) {
@@ -430,6 +434,73 @@ static int dit_ggml_generate(DiTGGML *           model,
             }
             fprintf(stderr, "[DiT] Cover: switched to non-cover context at step %d/%d\n", step, num_steps);
         }
+
+        // Re-evaluate the (optionally guided) velocity field at (xt_in, t_v),
+        // writing the result into vt_out[n_total]. Mirrors the inline per-step
+        // evaluation below; used ONLY as the model_fn callback for multi-eval
+        // solvers (Heun, RK4, ...). The inline path stays untouched, so all
+        // single-eval / C++ paths are byte-for-byte unchanged.
+        auto evaluate_velocity = [&](const float * xt_in, float t_v, float * vt_out) {
+            if (t_t)  ggml_backend_tensor_set(t_t, &t_v, 0, sizeof(float));
+            if (t_tr) ggml_backend_tensor_set(t_tr, &t_v, 0, sizeof(float));
+            ggml_backend_tensor_set(t_enc, enc_buf.data(), 0, enc_buf.size() * sizeof(float));
+            ggml_backend_tensor_set(t_pos, pos_data.data(), 0, S * N_graph * sizeof(int32_t));
+            ggml_backend_tensor_set(t_sa_mask_sw, sa_sw_data.data(), 0, S * S * N_graph * sizeof(uint16_t));
+            ggml_backend_tensor_set(t_sa_mask_pad, sa_pad_data.data(), 0, S * S * N_graph * sizeof(uint16_t));
+            ggml_backend_tensor_set(t_ca_mask, ca_data.data(), 0, enc_S * S * N_graph * sizeof(uint16_t));
+            for (int b = 0; b < N; b++) {
+                for (int t = 0; t < T; t++) {
+                    memcpy(&input_buf[b * T * in_ch + t * in_ch + ctx_ch], &xt_in[b * n_per + t * Oc],
+                           Oc * sizeof(float));
+                }
+                if (batch_cfg) {
+                    for (int t = 0; t < T; t++) {
+                        memcpy(&input_buf[(N + b) * T * in_ch + t * in_ch + ctx_ch], &xt_in[b * n_per + t * Oc],
+                               Oc * sizeof(float));
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t_input, input_buf.data(), 0, in_ch * T * N_graph * sizeof(float));
+            ggml_backend_sched_graph_compute(model->sched, gf);
+
+            auto apply_guidance = [&](float * out) {
+                for (int b = 0; b < N; b++) {
+                    if (use_lua_guidance) {
+                        GuidanceCtx gctx{ step, num_steps,
+                                          t_v - (step + 1 < num_steps ? schedule[step + 1] : 0.0f), t_v };
+                        static const std::unordered_map<std::string, std::string> no_params;
+                        lua_call_guidance(*guidance_plugin, vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per,
+                                          guidance_scale, apg_mbufs[b], out + b * n_per, Oc, T, gctx, 2.5f, no_params);
+                    } else {
+                        apg_forward(vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per, guidance_scale,
+                                    apg_mbufs[b], out + b * n_per, Oc, T);
+                    }
+                }
+            };
+
+            if (batch_cfg) {
+                std::vector<float> full_output(n_per * N_graph);
+                ggml_backend_tensor_get(t_output, full_output.data(), 0, n_per * N_graph * sizeof(float));
+                memcpy(vt_cond.data(), full_output.data(), n_total * sizeof(float));
+                memcpy(vt_uncond.data(), full_output.data() + n_total, n_total * sizeof(float));
+                apply_guidance(vt_out);
+            } else if (do_cfg) {
+                ggml_backend_tensor_get(t_output, vt_cond.data(), 0, n_total * sizeof(float));
+                ggml_backend_tensor_set(t_enc, null_enc_buf.data(), 0, H_enc * enc_S * N * sizeof(float));
+                ggml_backend_tensor_set(t_input, input_buf.data(), 0, in_ch * T * N * sizeof(float));
+                if (t_t)  ggml_backend_tensor_set(t_t, &t_v, 0, sizeof(float));
+                if (t_tr) ggml_backend_tensor_set(t_tr, &t_v, 0, sizeof(float));
+                ggml_backend_tensor_set(t_pos, pos_data.data(), 0, S * N * sizeof(int32_t));
+                ggml_backend_tensor_set(t_sa_mask_sw, sa_sw_data.data(), 0, S * S * N * sizeof(uint16_t));
+                ggml_backend_tensor_set(t_sa_mask_pad, sa_pad_data.data(), 0, S * S * N * sizeof(uint16_t));
+                ggml_backend_tensor_set(t_ca_mask, ca_data.data(), 0, enc_S * S * N * sizeof(uint16_t));
+                ggml_backend_sched_graph_compute(model->sched, gf);
+                ggml_backend_tensor_get(t_output, vt_uncond.data(), 0, n_total * sizeof(float));
+                apply_guidance(vt_out);
+            } else {
+                ggml_backend_tensor_get(t_output, vt_out, 0, n_total * sizeof(float));
+            }
+        };
 
         // Set timestep (changes each step)
         if (t_t) {
@@ -609,8 +680,20 @@ static int dit_ggml_generate(DiTGGML *           model,
             solver_state.step_index = step;
             if (use_lua_solver) {
                 static const std::unordered_map<std::string, std::string> no_params;
-                lua_call_solver_step(*solver_plugin, xt.data(), vt.data(), t_curr, t_next, n_total, solver_state, {},
-                                     vt.data(), no_params);
+                if (solver_plugin->needs_model) {
+                    // Multi-eval: snapshot vt as the read-only velocity (model_fn
+                    // overwrites the live vt buffer during the step), and provide
+                    // the re-evaluation callback.
+                    vt_pre_solver.assign(vt.begin(), vt.end());
+                    SolverModelFn model_fn = [&](const float * xt_in, float t_v) {
+                        evaluate_velocity(xt_in, t_v, vt.data());
+                    };
+                    lua_call_solver_step(*solver_plugin, xt.data(), vt_pre_solver.data(), t_curr, t_next, n_total,
+                                         solver_state, model_fn, vt.data(), no_params);
+                } else {
+                    lua_call_solver_step(*solver_plugin, xt.data(), vt.data(), t_curr, t_next, n_total, solver_state, {},
+                                         vt.data(), no_params);
+                }
             } else {
                 solver_info->step_fn(xt.data(), vt.data(), t_curr, t_next, n_total, solver_state, {}, vt.data());
             }
@@ -647,9 +730,13 @@ static int dit_ggml_generate(DiTGGML *           model,
                 float s_high     = (1.0f - t_curr) * dcw_scaler;  // high-only uses dcw_scaler with inverse modulation
                 float s_double_h = (1.0f - t_curr) * dcw_high_scaler;  // double mode high coefficient
                 float s_pix      = dcw_scaler;                         // constant per paper
+                // Multi-eval solvers overwrite the live vt during the step; use the
+                // pre-solver snapshot for the DCW reconstruction.
+                const float * dcw_vt = (use_lua_solver && solver_plugin->needs_model) ? vt_pre_solver.data()
+                                                                                      : vt.data();
                 for (int b = 0; b < N; b++) {
                     const float * xt_b = xt.data() + b * n_per;
-                    const float * vt_b = vt.data() + b * n_per;
+                    const float * vt_b = dcw_vt + b * n_per;
                     for (int i = 0; i < n_per; i++) {
                         denoised[i] = xt_b[i] - vt_b[i] * t_next;
                     }
