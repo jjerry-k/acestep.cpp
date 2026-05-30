@@ -71,6 +71,14 @@ struct AceRequest {
     float repainting_start;  // 0
     float repainting_end;    // -1
 
+    // HOT-Step reinject repaint (opt-in alternative to the default latent splice).
+    // When repaint_injection_ratio > 0 on a repaint task, the preserved region is
+    // re-locked to noised source each step (for the first ratio*steps steps) and
+    // the boundaries are crossfade-blended (repaint_crossfade_frames). The default
+    // hard latent/waveform splice is skipped in this mode.
+    float repaint_injection_ratio;   // 0 = off (use default splice); (0,1] enables reinject
+    int   repaint_crossfade_frames;  // 0 = no boundary blend
+
     // Latent post-processing applied after DiT sampling, before VAE decode:
     //   pred = pred * latent_rescale + latent_shift
     // Defaults are no-op.
@@ -90,10 +98,26 @@ struct AceRequest {
     // track name for lego/extract/complete (e.g. "vocals", "drums", "guitar")
     std::string track;  // ""
 
-    // Solver name resolved by solver_lookup() (see src/solvers).
-    // Accepted values: "euler", "sde", "dpm3m", "stork4".
+    // Solver name resolved by solver_lookup() (see src/solvers) or, when
+    // lua_plugins is set, by the Lua plugin registry (plugins/solvers/*.lua).
     std::string solver;          // "euler"
     int         stork_substeps;  // 10, only used by the "stork4" solver
+
+    // Lua plugin system (plugins/{solvers,schedulers,guidance}/*.lua).
+    // lua_plugins=true routes solver/scheduler/guidance through Lua plugins
+    // (env ACE_LUA_SOLVER / ACE_LUA_SCHEDULER / ACE_LUA_GUIDANCE force-enable
+    // each independently). scheduler/guidance_mode select the plugin by name;
+    // empty falls back to "linear" / "apg".
+    bool        lua_plugins;    // false
+    std::string scheduler;      // "" -> "linear"
+    std::string guidance_mode;  // "" -> "apg"
+
+    // Post-VAE CPU audio post-processing (off by default; output unchanged when off).
+    // denoise: spectral-gating denoiser (self-estimating when no profile).
+    float       denoise_strength;   // 0 = off, (0,1] enables
+    float       denoise_smoothing;  // 0.7
+    float       denoise_mix;        // 0.25
+    bool        spectral_lift;      // false = off (spectral lifter, default params)
 
     // LM mode: "generate" (full: metadata + lyrics + codes),
     // "inspire" (short query -> metadata + lyrics, no codes),

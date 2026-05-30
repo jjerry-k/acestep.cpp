@@ -43,6 +43,26 @@
 #    undef MINIMP3_IMPLEMENTATION
 #endif
 
+// dr_flac (public domain): FLAC decoder. Guard against double-implementation.
+#ifndef AUDIO_IO_DRFLAC_IMPL
+#    define AUDIO_IO_DRFLAC_IMPL
+#    define DR_FLAC_IMPLEMENTATION
+#    ifdef _MSC_VER
+#        pragma warning(push, 0)
+#    elif defined(__GNUC__)
+#        pragma GCC diagnostic push
+#        pragma GCC diagnostic ignored "-Wconversion"
+#        pragma GCC diagnostic ignored "-Wsign-conversion"
+#    endif
+#    include "vendor/dr_flac/dr_flac.h"
+#    ifdef _MSC_VER
+#        pragma warning(pop)
+#    elif defined(__GNUC__)
+#        pragma GCC diagnostic pop
+#    endif
+#    undef DR_FLAC_IMPLEMENTATION
+#endif
+
 // mp3enc: MP3 encoder
 #include "mp3/mp3enc.h"
 
@@ -262,11 +282,48 @@ static float * audio_io_read_wav(const char * path, int * T_out, int * sr_out) {
     return result;
 }
 
-// Read WAV or MP3 (auto-detect from extension).
+// Read a FLAC file into planar stereo float [L: T][R: T]. Caller frees.
+// Mono is duplicated to both channels; >2 channels take the first two.
+static float * audio_io_read_flac(const char * path, int * T_out, int * sr_out) {
+    *T_out  = 0;
+    *sr_out = 0;
+
+    unsigned int  channels    = 0;
+    unsigned int  sample_rate = 0;
+    drflac_uint64 total       = 0;
+    float * interleaved = drflac_open_file_and_read_pcm_frames_f32(path, &channels, &sample_rate, &total, NULL);
+    if (!interleaved || channels == 0 || total == 0) {
+        if (interleaved) drflac_free(interleaved, NULL);
+        return NULL;
+    }
+
+    int     T      = (int) total;
+    float * planar = (float *) malloc((size_t) T * 2 * sizeof(float));
+    if (!planar) {
+        drflac_free(interleaved, NULL);
+        return NULL;
+    }
+    for (int t = 0; t < T; t++) {
+        float l = interleaved[(size_t) t * channels + 0];
+        float r = (channels >= 2) ? interleaved[(size_t) t * channels + 1] : l;
+        planar[t]     = l;
+        planar[T + t] = r;
+    }
+    drflac_free(interleaved, NULL);
+
+    *T_out  = T;
+    *sr_out = (int) sample_rate;
+    return planar;
+}
+
+// Read WAV, MP3, or FLAC (auto-detect from extension).
 // Returns planar stereo float [L: T][R: T]. Caller frees.
 static float * audio_read(const char * path, int * T_out, int * sr_out) {
     if (audio_io_ends_with(path, ".mp3")) {
         return audio_io_read_mp3(path, T_out, sr_out);
+    }
+    if (audio_io_ends_with(path, ".flac")) {
+        return audio_io_read_flac(path, T_out, sr_out);
     }
     return audio_io_read_wav(path, T_out, sr_out);
 }

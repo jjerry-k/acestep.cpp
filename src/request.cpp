@@ -45,6 +45,8 @@ void request_init(AceRequest * r) {
     r->cover_noise_strength = 0.0f;
     r->repainting_start     = 0.0f;
     r->repainting_end       = -1.0f;
+    r->repaint_injection_ratio  = 0.0f;
+    r->repaint_crossfade_frames = 0;
     r->latent_shift         = 0.0f;
     r->latent_rescale       = 1.0f;
     r->custom_timesteps     = "";
@@ -52,6 +54,13 @@ void request_init(AceRequest * r) {
     r->track                = "";
     r->solver               = SOLVER_EULER;
     r->stork_substeps       = STORK_SUBSTEPS_DEFAULT;
+    r->lua_plugins          = false;
+    r->scheduler            = "";
+    r->guidance_mode        = "";
+    r->denoise_strength     = 0.0f;
+    r->denoise_smoothing    = 0.7f;
+    r->denoise_mix          = 0.25f;
+    r->spectral_lift        = false;
     r->lm_mode              = LM_MODE_NAME_GENERATE;
     r->output_format        = OUTPUT_FORMAT_MP3;
     r->synth_model          = "";
@@ -105,6 +114,27 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "stork_substeps")) && yyjson_is_int(v)) {
         r->stork_substeps = (int) yyjson_get_int(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lua_plugins")) && yyjson_is_bool(v)) {
+        r->lua_plugins = yyjson_get_bool(v);
+    }
+    if ((v = yyjson_obj_get(obj, "scheduler")) && yyjson_is_str(v)) {
+        r->scheduler = yy_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "guidance_mode")) && yyjson_is_str(v)) {
+        r->guidance_mode = yy_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "denoise_strength")) && yyjson_is_num(v)) {
+        r->denoise_strength = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "denoise_smoothing")) && yyjson_is_num(v)) {
+        r->denoise_smoothing = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "denoise_mix")) && yyjson_is_num(v)) {
+        r->denoise_mix = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "spectral_lift")) && yyjson_is_bool(v)) {
+        r->spectral_lift = yyjson_get_bool(v);
     }
     if ((v = yyjson_obj_get(obj, "custom_timesteps")) && yyjson_is_str(v)) {
         r->custom_timesteps = yy_str(v);
@@ -190,6 +220,12 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "repainting_end")) && yyjson_is_num(v)) {
         r->repainting_end = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "repaint_injection_ratio")) && yyjson_is_num(v)) {
+        r->repaint_injection_ratio = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "repaint_crossfade_frames")) && yyjson_is_int(v)) {
+        r->repaint_crossfade_frames = (int) yyjson_get_int(v);
     }
     if ((v = yyjson_obj_get(obj, "latent_shift")) && yyjson_is_num(v)) {
         r->latent_shift = (float) yyjson_get_num(v);
@@ -409,6 +445,27 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     if (all || r->stork_substeps != def.stork_substeps) {
         yyjson_mut_obj_add_int(doc, root, "stork_substeps", r->stork_substeps);
     }
+    if (all || r->lua_plugins != def.lua_plugins) {
+        yyjson_mut_obj_add_bool(doc, root, "lua_plugins", r->lua_plugins);
+    }
+    if (all || r->scheduler != def.scheduler) {
+        yyjson_mut_obj_add_str(doc, root, "scheduler", r->scheduler.c_str());
+    }
+    if (all || r->guidance_mode != def.guidance_mode) {
+        yyjson_mut_obj_add_str(doc, root, "guidance_mode", r->guidance_mode.c_str());
+    }
+    if (all || r->denoise_strength != def.denoise_strength) {
+        yyjson_mut_obj_add_real(doc, root, "denoise_strength", r->denoise_strength);
+    }
+    if (all || r->denoise_smoothing != def.denoise_smoothing) {
+        yyjson_mut_obj_add_real(doc, root, "denoise_smoothing", r->denoise_smoothing);
+    }
+    if (all || r->denoise_mix != def.denoise_mix) {
+        yyjson_mut_obj_add_real(doc, root, "denoise_mix", r->denoise_mix);
+    }
+    if (all || r->spectral_lift != def.spectral_lift) {
+        yyjson_mut_obj_add_bool(doc, root, "spectral_lift", r->spectral_lift);
+    }
     // lm_mode and output_format follow the same rule: enumerations with a
     // guaranteed non-empty value, always explicit in serialized output.
     yyjson_mut_obj_add_str(doc, root, "lm_mode", r->lm_mode.c_str());
@@ -431,6 +488,12 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     }
     if (all || r->repainting_end != def.repainting_end) {
         yyjson_mut_obj_add_real(doc, root, "repainting_end", r->repainting_end);
+    }
+    if (all || r->repaint_injection_ratio != def.repaint_injection_ratio) {
+        yyjson_mut_obj_add_real(doc, root, "repaint_injection_ratio", r->repaint_injection_ratio);
+    }
+    if (all || r->repaint_crossfade_frames != def.repaint_crossfade_frames) {
+        yyjson_mut_obj_add_int(doc, root, "repaint_crossfade_frames", r->repaint_crossfade_frames);
     }
     if (all || r->latent_shift != def.latent_shift) {
         yyjson_mut_obj_add_real(doc, root, "latent_shift", r->latent_shift);

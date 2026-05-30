@@ -5,10 +5,12 @@
 // under --models <dir> and --adapters <dir>.
 
 #include "audio-io.h"
+#include "denoiser.h"
 #include "model-registry.h"
 #include "model-store.h"
 #include "pipeline-synth.h"
 #include "request.h"
+#include "spectral-lifter.h"
 #include "synth-batch-runner.h"
 #include "task-types.h"
 #include "version.h"
@@ -315,6 +317,20 @@ int main(int argc, char ** argv) {
         if (!all_audio[b].samples) {
             continue;
         }
+
+        // Post-VAE CPU audio post-processing (opt-in; no-op when off so output
+        // is unchanged by default). samples are planar stereo [L:T][R:T].
+        const AceRequest & rq = groups[0][b];
+        if (rq.denoise_strength > 0.0f) {
+            audio_denoise(all_audio[b].samples, all_audio[b].n_samples, 48000, rq.denoise_strength,
+                          rq.denoise_smoothing, rq.denoise_mix, nullptr);
+        }
+        if (rq.spectral_lift) {
+            SpectralLifterParams slp;
+            spectral_lifter_default(&slp);
+            spectral_lifter_process(all_audio[b].samples, all_audio[b].n_samples, 48000, &slp);
+        }
+
         const char * ext = is_mp3 ? ".mp3" : ".wav";
         char         out_path[1024];
         snprintf(out_path, sizeof(out_path), "%s%d%s", all_basenames[b].c_str(), all_synth_indices[b], ext);
