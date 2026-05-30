@@ -10,6 +10,7 @@
 #include "dwt-haar.h"
 #include "guidance/apg-core.h"
 #include "lua-plugin-registry.h"
+#include "sampler-repaint.h"
 #include "solvers/solver-registry.h"
 
 #include <cmath>
@@ -91,7 +92,12 @@ static int dit_ggml_generate(DiTGGML *           model,
                              const char *    solver_name        = "euler",
                              int             stork_substeps     = 10,
                              const char *    guidance_mode_in   = "apg",
-                             bool            lua_plugins        = false) {
+                             bool            lua_plugins        = false,
+                             const float *   repaint_src        = nullptr,
+                             int             repaint_t0         = 0,
+                             int             repaint_t1         = 0,
+                             float           repaint_injection_ratio  = 0.0f,
+                             int             repaint_crossfade_frames = 0) {
     DiTGGMLConfig & c       = model->cfg;
     int             Oc      = c.out_channels;      // 64
     int             ctx_ch  = c.in_channels - Oc;  // 128
@@ -768,6 +774,15 @@ static int dit_ggml_generate(DiTGGML *           model,
             }
         }
 
+        // HOT-Step repaint (opt-in): re-inject noised source into the preserved
+        // region (outside [t0,t1)) each step so the generated repaint zone stays
+        // conditioned on the correct context. Off unless repaint_injection_ratio>0.
+        if (repaint_src && repaint_injection_ratio > 0.0f && repaint_t1 > repaint_t0 && step < num_steps - 1) {
+            float t_next = schedule[step + 1];
+            sampler_repaint_inject(xt.data(), noise, repaint_src, N, T, Oc, repaint_t0, repaint_t1,
+                                   repaint_injection_ratio, step, num_steps, t_next);
+        }
+
         // debug dump (sample 0 only)
         if (dbg && dbg->enabled) {
             char name[64];
@@ -781,6 +796,14 @@ static int dit_ggml_generate(DiTGGML *           model,
         }
 
         fprintf(stderr, "[DiT] Step %d/%d t=%.3f\n", step + 1, num_steps, t_curr);
+    }
+
+    // HOT-Step repaint (opt-in): crossfade-blend the repaint zone boundaries in
+    // latent space for a smooth seam (vs a hard splice). Off unless frames>0.
+    if (repaint_src && repaint_crossfade_frames > 0 && repaint_t1 > repaint_t0) {
+        sampler_repaint_blend(output, repaint_src, N, T, Oc, repaint_t0, repaint_t1, repaint_crossfade_frames);
+        fprintf(stderr, "[DiT] Repaint crossfade blend: %d frames at [%d,%d) boundaries\n",
+                repaint_crossfade_frames, repaint_t0, repaint_t1);
     }
 
     // Batch diagnostic: report per-sample stats to catch corruption

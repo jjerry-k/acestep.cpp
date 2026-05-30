@@ -45,6 +45,8 @@ void request_init(AceRequest * r) {
     r->cover_noise_strength = 0.0f;
     r->repainting_start     = 0.0f;
     r->repainting_end       = -1.0f;
+    r->repaint_injection_ratio  = 0.0f;
+    r->repaint_crossfade_frames = 0;
     r->latent_shift         = 0.0f;
     r->latent_rescale       = 1.0f;
     r->custom_timesteps     = "";
@@ -218,6 +220,12 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "repainting_end")) && yyjson_is_num(v)) {
         r->repainting_end = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "repaint_injection_ratio")) && yyjson_is_num(v)) {
+        r->repaint_injection_ratio = (float) yyjson_get_num(v);
+    }
+    if ((v = yyjson_obj_get(obj, "repaint_crossfade_frames")) && yyjson_is_int(v)) {
+        r->repaint_crossfade_frames = (int) yyjson_get_int(v);
     }
     if ((v = yyjson_obj_get(obj, "latent_shift")) && yyjson_is_num(v)) {
         r->latent_shift = (float) yyjson_get_num(v);
@@ -480,6 +488,12 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     }
     if (all || r->repainting_end != def.repainting_end) {
         yyjson_mut_obj_add_real(doc, root, "repainting_end", r->repainting_end);
+    }
+    if (all || r->repaint_injection_ratio != def.repaint_injection_ratio) {
+        yyjson_mut_obj_add_real(doc, root, "repaint_injection_ratio", r->repaint_injection_ratio);
+    }
+    if (all || r->repaint_crossfade_frames != def.repaint_crossfade_frames) {
+        yyjson_mut_obj_add_int(doc, root, "repaint_crossfade_frames", r->repaint_crossfade_frames);
     }
     if (all || r->latent_shift != def.latent_shift) {
         yyjson_mut_obj_add_real(doc, root, "latent_shift", r->latent_shift);

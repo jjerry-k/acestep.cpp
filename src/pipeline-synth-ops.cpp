@@ -863,6 +863,12 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
         dit->use_flash_attn = false;
     }
 
+    // HOT-Step reinject repaint mode (opt-in): pass the clean source latent so the
+    // sampler can lock the preserved region per step + crossfade-blend boundaries.
+    const bool    hot_reinject = s.is_repaint && s.rr.repaint_injection_ratio > 0.0f && s.have_cover &&
+                              (int) s.cover_latents.size() >= s.T * s.Oc;
+    const float * repaint_src  = hot_reinject ? s.cover_latents.data() : nullptr;
+
     s.timer.reset();
     int dit_rc = dit_ggml_generate(
         dit, s.noise.data(), s.context.data(), s.enc_hidden.data(), s.enc_S, s.T, batch_n, s.num_steps,
@@ -871,7 +877,8 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
         s.per_S.data(), s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
         s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(), s.seeds.data(), ctx->params.use_batch_cfg,
         s.rr.dcw_scaler, s.rr.dcw_high_scaler, s.rr.dcw_mode.c_str(), s.rr.solver.c_str(), s.rr.stork_substeps,
-        s.rr.guidance_mode.c_str(), s.rr.lua_plugins);
+        s.rr.guidance_mode.c_str(), s.rr.lua_plugins, repaint_src, s.repaint_t0, s.repaint_t1,
+        s.rr.repaint_injection_ratio, s.rr.repaint_crossfade_frames);
     if (dit_rc != 0) {
         return -1;
     }
@@ -908,7 +915,10 @@ int ops_vae_decode(const AceSynth * ctx,
     // Latent splice for repaint/lego: keep s.output inside [t0, t1), copy
     // s.cover_latents outside. Hard cut at frame boundary, the VAE tiled
     // decoder smooths the seam in the waveform.
-    bool have_region = s.is_repaint || s.is_lego_region;
+    // Skipped in HOT reinject mode (repaint_injection_ratio>0): the sampler already
+    // locks the preserved region per step and crossfade-blends the boundaries.
+    bool hot_reinject = s.is_repaint && s.rr.repaint_injection_ratio > 0.0f;
+    bool have_region  = (s.is_repaint || s.is_lego_region) && !hot_reinject;
     if (have_region && s.have_cover && s.T_cover > 0) {
         int copy_T = s.T_cover < s.T ? s.T_cover : s.T;
         for (int b = 0; b < batch_n; b++) {

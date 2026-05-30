@@ -71,6 +71,14 @@ struct AceRequest {
     float repainting_start;  // 0
     float repainting_end;    // -1
 
+    // HOT-Step reinject repaint (opt-in alternative to the default latent splice).
+    // When repaint_injection_ratio > 0 on a repaint task, the preserved region is
+    // re-locked to noised source each step (for the first ratio*steps steps) and
+    // the boundaries are crossfade-blended (repaint_crossfade_frames). The default
+    // hard latent/waveform splice is skipped in this mode.
+    float repaint_injection_ratio;   // 0 = off (use default splice); (0,1] enables reinject
+    int   repaint_crossfade_frames;  // 0 = no boundary blend
+
     // Latent post-processing applied after DiT sampling, before VAE decode:
     //   pred = pred * latent_rescale + latent_shift
     // Defaults are no-op.
