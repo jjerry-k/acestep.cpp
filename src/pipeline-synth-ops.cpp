@@ -301,6 +301,24 @@ void ops_build_schedule(SynthState & s) {
         }
         fprintf(stderr, "[Build-Schedule] WARN: custom_timesteps needs >= 2 values, falling back to shift\n");
     }
+    // Optional Lua plugin scheduler dispatch (ACE_LUA_SCHEDULER=1). Default keeps
+    // the native formula below. scheduler_mode defaults to "linear" (request-driven
+    // selection is wired in a later phase). The linear.lua plugin reproduces the
+    // same t = 1 - i/steps base + shift warp.
+    if (const char * env = getenv("ACE_LUA_SCHEDULER"); env && atoi(env) != 0) {
+        ace_ensure_plugins();
+        const char * scheduler_mode = "linear";
+        LuaPlugin *  sp             = PluginRegistry::instance().scheduler_lookup(scheduler_mode);
+        if (sp) {
+            s.schedule.resize(s.num_steps);
+            static const std::unordered_map<std::string, std::string> no_params;
+            lua_call_scheduler(*sp, s.schedule.data(), s.num_steps, s.shift, no_params);
+            fprintf(stderr, "[Build-Schedule] Lua scheduler: %s (%d steps, shift=%.2f)\n", sp->name.c_str(),
+                    s.num_steps, s.shift);
+            return;
+        }
+        fprintf(stderr, "[Build-Schedule] WARN: Lua scheduler '%s' not found, using native\n", scheduler_mode);
+    }
     // Default: t_i = shift * t / (1 + (shift-1)*t) with t = 1 - i/steps
     s.schedule.resize(s.num_steps);
     for (int i = 0; i < s.num_steps; i++) {

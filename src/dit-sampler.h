@@ -8,118 +8,52 @@
 #include "dit-graph.h"
 #include "dit.h"
 #include "dwt-haar.h"
+#include "guidance/apg-core.h"
+#include "lua-plugin-registry.h"
 #include "solvers/solver-registry.h"
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
-// APG (Adaptive Projected Guidance) for DiT CFG
-// Matches Python ACE-Step-1.5 acestep/models/base/apg_guidance.py
-struct APGMomentumBuffer {
-    double              momentum;
-    std::vector<double> running_average;
-    bool                initialized;
-
-    APGMomentumBuffer(double m = -0.75) : momentum(m), initialized(false) {}
-
-    void update(const double * values, int n) {
-        if (!initialized) {
-            running_average.assign(values, values + n);
-            initialized = true;
-        } else {
-            for (int i = 0; i < n; i++) {
-                running_average[i] = values[i] + momentum * running_average[i];
-            }
-        }
+// Resolve the directory that contains plugins/ (the Lua plugin system).
+// Override with ACE_PLUGINS_DIR; otherwise derived from the executable path
+// (<exe_dir>/.. — binaries live in build/, plugins/ sits in the repo root).
+static std::string ace_resolve_engine_dir() {
+    if (const char * env = getenv("ACE_PLUGINS_DIR"); env && env[0]) {
+        return std::string(env);
     }
-};
+    char    buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        std::string exe(buf);
+        size_t      slash   = exe.find_last_of('/');
+        std::string exe_dir = (slash != std::string::npos) ? exe.substr(0, slash) : ".";
+        return exe_dir + "/..";  // plugins/ is one level above build/
+    }
+    return ".";
+}
 
-// project(v0, v1, dims=[1]): decompose v0 into parallel + orthogonal w.r.t. v1
-// All math in double precision matching Python .double() calls.
-// Layout: memory [T, Oc] time-major (ggml ne=[Oc, T]).
-// Python dims=[1] on [B,T,C] = normalize/project per channel over T dimension.
-// In memory [T, Oc] layout: for each channel c, operate over all T time frames.
-static void apg_project(const double * v0, const double * v1, double * out_par, double * out_orth, int Oc, int T) {
-    for (int c = 0; c < Oc; c++) {
-        double norm2 = 0.0;
-        for (int t = 0; t < T; t++) {
-            norm2 += v1[t * Oc + c] * v1[t * Oc + c];
-        }
-        double inv_norm = (norm2 > 1e-60) ? (1.0 / sqrt(norm2)) : 0.0;
-
-        double dot = 0.0;
-        for (int t = 0; t < T; t++) {
-            dot += v0[t * Oc + c] * (v1[t * Oc + c] * inv_norm);
-        }
-
-        for (int t = 0; t < T; t++) {
-            int    idx    = t * Oc + c;
-            double v1n    = v1[idx] * inv_norm;
-            out_par[idx]  = dot * v1n;
-            out_orth[idx] = v0[idx] - out_par[idx];
-        }
+// Lazy one-time init of the Lua plugin registry (shared by solver, guidance,
+// and scheduler dispatch). Safe to call repeatedly.
+static void ace_ensure_plugins() {
+    static bool inited = false;
+    if (!inited) {
+        PluginRegistry::instance().init(ace_resolve_engine_dir(), "");
+        inited = true;
     }
 }
 
-// APG forward matching Python apg_forward() exactly:
-//   1. diff = cond - uncond
-//   2. momentum.update(diff); diff = running_average
-//   3. norm clip: per-channel L2 over T (dims=[1]), clip to norm_threshold=2.5
-//   4. project(diff, pred_COND) -> (parallel, orthogonal)
-//   5. result = pred_cond + (scale - 1) * orthogonal
-// Internal computation in double precision (Python uses .double()).
-static void apg_forward(const float *       pred_cond,
-                        const float *       pred_uncond,
-                        float               guidance_scale,
-                        APGMomentumBuffer & mbuf,
-                        float *             result,
-                        int                 Oc,
-                        int                 T,
-                        float               norm_threshold = 2.5f) {
-    int n = Oc * T;
-
-    // 1. diff = cond - uncond (promote to double)
-    std::vector<double> diff(n);
-    for (int i = 0; i < n; i++) {
-        diff[i] = (double) pred_cond[i] - (double) pred_uncond[i];
-    }
-
-    // 2. momentum update, then use smoothed diff
-    mbuf.update(diff.data(), n);
-    memcpy(diff.data(), mbuf.running_average.data(), n * sizeof(double));
-
-    // 3. norm clipping: per-channel L2 over T (dims=[1]), clip to threshold
-    if (norm_threshold > 0.0f) {
-        for (int c = 0; c < Oc; c++) {
-            double norm2 = 0.0;
-            for (int t = 0; t < T; t++) {
-                norm2 += diff[t * Oc + c] * diff[t * Oc + c];
-            }
-            double norm = sqrt(norm2 > 0.0 ? norm2 : 0.0);
-            double s    = (norm > 1e-60) ? fmin(1.0, (double) norm_threshold / norm) : 1.0;
-            if (s < 1.0) {
-                for (int t = 0; t < T; t++) {
-                    diff[t * Oc + c] *= s;
-                }
-            }
-        }
-    }
-
-    // 4. project(diff, pred_COND) -> orthogonal component (double precision)
-    std::vector<double> pred_cond_d(n), par(n), orth(n);
-    for (int i = 0; i < n; i++) {
-        pred_cond_d[i] = (double) pred_cond[i];
-    }
-    apg_project(diff.data(), pred_cond_d.data(), par.data(), orth.data(), Oc, T);
-
-    // 5. result = pred_cond + (scale - 1) * orthogonal (back to float)
-    double w = (double) guidance_scale - 1.0;
-    for (int i = 0; i < n; i++) {
-        result[i] = (float) ((double) pred_cond[i] + w * orth[i]);
-    }
-}
+// APG (Adaptive Projected Guidance) primitives — APGMomentumBuffer, apg_project,
+// apg_forward — now live in guidance/apg-core.h (shared with the Lua guidance
+// plugin bridge). Included above. Math is byte-for-byte identical to the prior
+// inline definition.
 
 // Flow matching generation loop (batched)
 // Runs num_steps euler steps to denoise N latent samples in parallel.
@@ -394,8 +328,57 @@ static int dit_ggml_generate(DiTGGML *           model,
         fprintf(stderr, "[DiT] WARNING: unknown solver '%s', falling back to euler\n", solver_name);
         solver_info = solver_lookup("euler");
     }
-    fprintf(stderr, "[DiT] Solver: %s (%d NFE/step, order %d)\n", solver_info->display_name, solver_info->nfe,
-            solver_info->order);
+
+    // Optional Lua plugin solver dispatch (ACE_LUA_SOLVER=1). Default keeps the
+    // native C++ path. Per-step (1-NFE, non-owns_loop) solvers only in this phase;
+    // owns_loop / needs_model solvers fall back to C++ (handled in a later phase).
+    LuaPlugin * solver_plugin   = nullptr;
+    bool        use_lua_solver  = false;
+    if (const char * env = getenv("ACE_LUA_SOLVER"); env && atoi(env) != 0) {
+        ace_ensure_plugins();
+        solver_plugin = PluginRegistry::instance().solver_lookup(solver_name);
+        if (!solver_plugin) {
+            fprintf(stderr, "[DiT] WARNING: Lua solver '%s' not found, using C++ path\n", solver_name);
+        } else if (solver_plugin->owns_loop || solver_plugin->needs_model) {
+            fprintf(stderr, "[DiT] WARNING: Lua solver '%s' needs full-loop/model_fn (later phase), using C++ path\n",
+                    solver_name);
+            solver_plugin = nullptr;
+        } else {
+            use_lua_solver = true;
+            fprintf(stderr, "[DiT] Solver (Lua): %s (%s, %d NFE/step, order %d)\n",
+                    solver_plugin->display_name.c_str(), solver_plugin->name.c_str(),
+                    solver_plugin->nfe, solver_plugin->order);
+        }
+    }
+    if (!use_lua_solver) {
+        fprintf(stderr, "[DiT] Solver: %s (%d NFE/step, order %d)\n", solver_info->display_name, solver_info->nfe,
+                solver_info->order);
+    }
+    // Stochastic flag for DCW gating (DCW is ODE-only).
+    const bool solver_injects_noise = use_lua_solver ? solver_plugin->stochastic : solver_info->injects_noise;
+
+    // Optional Lua plugin guidance dispatch (ACE_LUA_GUIDANCE=1). Default keeps the
+    // native inline APG. guidance_mode defaults to "apg" (only native mode today;
+    // request-driven mode selection is wired in a later phase). The apg.lua plugin
+    // routes back through the native apg_forward(), so results stay identical.
+    LuaPlugin *  guidance_plugin = nullptr;
+    bool         use_lua_guidance = false;
+    const char * guidance_mode    = "apg";
+    if (const char * env = getenv("ACE_LUA_GUIDANCE"); env && atoi(env) != 0) {
+        ace_ensure_plugins();
+        guidance_plugin = PluginRegistry::instance().guidance_lookup(guidance_mode);
+        if (!guidance_plugin) {
+            fprintf(stderr, "[DiT] WARNING: Lua guidance '%s' not found, using native APG\n", guidance_mode);
+        } else if (guidance_plugin->has_post_step) {
+            fprintf(stderr, "[DiT] WARNING: guidance '%s' needs post_step (later phase), using native APG\n",
+                    guidance_mode);
+            guidance_plugin = nullptr;
+        } else {
+            use_lua_guidance = true;
+            fprintf(stderr, "[DiT] Guidance (Lua): %s (%s)\n", guidance_plugin->display_name.c_str(),
+                    guidance_plugin->name.c_str());
+        }
+    }
 
     SolverState solver_state;
     solver_state.seeds          = seeds;
@@ -542,10 +525,18 @@ static int dit_ggml_generate(DiTGGML *           model,
                 debug_dump_2d(dbg, name, vt_uncond.data(), T, Oc);
             }
 
-            // APG per sample
+            // APG per sample (native inline, or via Lua guidance plugin when enabled)
             for (int b = 0; b < N; b++) {
-                apg_forward(vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per, guidance_scale, apg_mbufs[b],
-                            vt.data() + b * n_per, Oc, T);
+                if (use_lua_guidance) {
+                    GuidanceCtx gctx{ step, num_steps, t_curr - (step + 1 < num_steps ? schedule[step + 1] : 0.0f),
+                                      t_curr };
+                    static const std::unordered_map<std::string, std::string> no_params;
+                    lua_call_guidance(*guidance_plugin, vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per,
+                                      guidance_scale, apg_mbufs[b], vt.data() + b * n_per, Oc, T, gctx, 2.5f, no_params);
+                } else {
+                    apg_forward(vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per, guidance_scale, apg_mbufs[b],
+                                vt.data() + b * n_per, Oc, T);
+                }
             }
         } else if (do_cfg) {
             // 2-pass: conditional output already computed, read it
@@ -580,10 +571,18 @@ static int dit_ggml_generate(DiTGGML *           model,
                 debug_dump_2d(dbg, name, vt_uncond.data(), T, Oc);
             }
 
-            // APG per sample
+            // APG per sample (native inline, or via Lua guidance plugin when enabled)
             for (int b = 0; b < N; b++) {
-                apg_forward(vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per, guidance_scale, apg_mbufs[b],
-                            vt.data() + b * n_per, Oc, T);
+                if (use_lua_guidance) {
+                    GuidanceCtx gctx{ step, num_steps, t_curr - (step + 1 < num_steps ? schedule[step + 1] : 0.0f),
+                                      t_curr };
+                    static const std::unordered_map<std::string, std::string> no_params;
+                    lua_call_guidance(*guidance_plugin, vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per,
+                                      guidance_scale, apg_mbufs[b], vt.data() + b * n_per, Oc, T, gctx, 2.5f, no_params);
+                } else {
+                    apg_forward(vt_cond.data() + b * n_per, vt_uncond.data() + b * n_per, guidance_scale, apg_mbufs[b],
+                                vt.data() + b * n_per, Oc, T);
+                }
             }
         } else {
             // read velocity output: [Oc, T, N]
@@ -608,7 +607,13 @@ static int dit_ggml_generate(DiTGGML *           model,
             // Modular solver dispatch. The solver mutates xt in place.
             // 1 NFE solvers ignore the model_fn callback (passed empty).
             solver_state.step_index = step;
-            solver_info->step_fn(xt.data(), vt.data(), t_curr, t_next, n_total, solver_state, {}, vt.data());
+            if (use_lua_solver) {
+                static const std::unordered_map<std::string, std::string> no_params;
+                lua_call_solver_step(*solver_plugin, xt.data(), vt.data(), t_curr, t_next, n_total, solver_state, {},
+                                     vt.data(), no_params);
+            } else {
+                solver_info->step_fn(xt.data(), vt.data(), t_curr, t_next, n_total, solver_state, {}, vt.data());
+            }
 
             // DCW: Differential Correction in Wavelet domain (CVPR 2026).
             // Sampler-side correction for SNR-t bias in flow matching.
@@ -623,7 +628,7 @@ static int dit_ggml_generate(DiTGGML *           model,
             // ODE-only: denoised = xt_after - vt * t_next (reconstructed from
             // post-step xt, since xt_before = xt + vt * dt for Euler ODE so
             // denoised = xt_before - vt * t_curr = xt - vt * t_next).
-            bool dcw_active = (dcw_scaler > 0.0f || dcw_high_scaler > 0.0f) && !solver_info->injects_noise;
+            bool dcw_active = (dcw_scaler > 0.0f || dcw_high_scaler > 0.0f) && !solver_injects_noise;
             if (dcw_active) {
                 int                Tl = (T + 1) / 2;
                 std::vector<float> denoised(n_per);

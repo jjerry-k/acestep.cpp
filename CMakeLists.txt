@@ -104,6 +104,18 @@ else()
     target_compile_options(yyjson PRIVATE -w)
 endif()
 
+# Lua 5.4 (MIT, embedded scripting for the plugin system)
+# All .c files except lua.c (standalone interpreter) and luac.c (compiler)
+file(GLOB LUA_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/vendor/lua/*.c")
+list(FILTER LUA_SOURCES EXCLUDE REGEX "(lua|luac)\\.c$")
+add_library(lua54 STATIC ${LUA_SOURCES})
+target_include_directories(lua54 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/vendor/lua)
+if(MSVC)
+    target_compile_options(lua54 PRIVATE /W0)
+else()
+    target_compile_options(lua54 PRIVATE -w)
+endif()
+
 # Core library (shared between binaries)
 add_library(acestep-core STATIC
     src/request.cpp
@@ -113,7 +125,7 @@ add_library(acestep-core STATIC
     src/pipeline-synth-ops.cpp
     src/pipeline-understand.cpp
 )
-target_link_libraries(acestep-core PUBLIC yyjson)
+target_link_libraries(acestep-core PUBLIC yyjson lua54)
 link_ggml_backends(acestep-core)
 
 # ace-synth: full pipeline (text-enc + cond + dit + vae + wav)
