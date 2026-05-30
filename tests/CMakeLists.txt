@@ -15,3 +15,9 @@ link_ggml_backends(test-model-store)
 add_executable(test-lm-prompt test-lm-prompt.cpp)
 target_link_libraries(test-lm-prompt PRIVATE acestep-core)
 link_ggml_backends(test-lm-prompt)
+
+# test-alignment: compile-guard for the ported (not-yet-wired) LRC alignment code
+# (dit-alignment-graph.h + lrc-alignment.h). Ensures it builds against ACE's DiT.
+add_executable(test-alignment test-alignment.cpp)
+target_link_libraries(test-alignment PRIVATE acestep-core)
+link_ggml_backends(test-alignment)
