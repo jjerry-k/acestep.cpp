@@ -90,10 +90,19 @@ struct AceRequest {
     // track name for lego/extract/complete (e.g. "vocals", "drums", "guitar")
     std::string track;  // ""
 
-    // Solver name resolved by solver_lookup() (see src/solvers).
-    // Accepted values: "euler", "sde", "dpm3m", "stork4".
+    // Solver name resolved by solver_lookup() (see src/solvers) or, when
+    // lua_plugins is set, by the Lua plugin registry (plugins/solvers/*.lua).
     std::string solver;          // "euler"
     int         stork_substeps;  // 10, only used by the "stork4" solver
+
+    // Lua plugin system (plugins/{solvers,schedulers,guidance}/*.lua).
+    // lua_plugins=true routes solver/scheduler/guidance through Lua plugins
+    // (env ACE_LUA_SOLVER / ACE_LUA_SCHEDULER / ACE_LUA_GUIDANCE force-enable
+    // each independently). scheduler/guidance_mode select the plugin by name;
+    // empty falls back to "linear" / "apg".
+    bool        lua_plugins;    // false
+    std::string scheduler;      // "" -> "linear"
+    std::string guidance_mode;  // "" -> "apg"
 
     // LM mode: "generate" (full: metadata + lyrics + codes),
     // "inspire" (short query -> metadata + lyrics, no codes),

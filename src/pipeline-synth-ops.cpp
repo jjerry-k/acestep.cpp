@@ -305,9 +305,11 @@ void ops_build_schedule(SynthState & s) {
     // the native formula below. scheduler_mode defaults to "linear" (request-driven
     // selection is wired in a later phase). The linear.lua plugin reproduces the
     // same t = 1 - i/steps base + shift warp.
-    if (const char * env = getenv("ACE_LUA_SCHEDULER"); env && atoi(env) != 0) {
+    const char * sched_env  = getenv("ACE_LUA_SCHEDULER");
+    bool         sched_lua  = s.rr.lua_plugins || (sched_env && atoi(sched_env) != 0);
+    if (sched_lua) {
         ace_ensure_plugins();
-        const char * scheduler_mode = "linear";
+        const char * scheduler_mode = s.rr.scheduler.empty() ? "linear" : s.rr.scheduler.c_str();
         LuaPlugin *  sp             = PluginRegistry::instance().scheduler_lookup(scheduler_mode);
         if (sp) {
             s.schedule.resize(s.num_steps);
@@ -868,7 +870,8 @@ int ops_dit_generate(const AceSynth * ctx, int batch_n, SynthState & s, bool (*c
         s.context_silence.empty() ? nullptr : s.context_silence.data(), s.cover_steps, cancel, cancel_data,
         s.per_S.data(), s.per_enc_S.data(), s.enc_hidden_nc.empty() ? nullptr : s.enc_hidden_nc.data(),
         s.per_enc_S_nc_final.empty() ? nullptr : s.per_enc_S_nc_final.data(), s.seeds.data(), ctx->params.use_batch_cfg,
-        s.rr.dcw_scaler, s.rr.dcw_high_scaler, s.rr.dcw_mode.c_str(), s.rr.solver.c_str(), s.rr.stork_substeps);
+        s.rr.dcw_scaler, s.rr.dcw_high_scaler, s.rr.dcw_mode.c_str(), s.rr.solver.c_str(), s.rr.stork_substeps,
+        s.rr.guidance_mode.c_str(), s.rr.lua_plugins);
     if (dit_rc != 0) {
         return -1;
     }

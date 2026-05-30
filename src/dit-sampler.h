@@ -89,7 +89,9 @@ static int dit_ggml_generate(DiTGGML *           model,
                              float           dcw_high_scaler    = 0.0f,
                              const char *    dcw_mode           = "low",
                              const char *    solver_name        = "euler",
-                             int             stork_substeps     = 10) {
+                             int             stork_substeps     = 10,
+                             const char *    guidance_mode_in   = "apg",
+                             bool            lua_plugins        = false) {
     DiTGGMLConfig & c       = model->cfg;
     int             Oc      = c.out_channels;      // 64
     int             ctx_ch  = c.in_channels - Oc;  // 128
@@ -334,7 +336,10 @@ static int dit_ggml_generate(DiTGGML *           model,
     // owns_loop / needs_model solvers fall back to C++ (handled in a later phase).
     LuaPlugin * solver_plugin   = nullptr;
     bool        use_lua_solver  = false;
-    if (const char * env = getenv("ACE_LUA_SOLVER"); env && atoi(env) != 0) {
+    {
+        const char * env        = getenv("ACE_LUA_SOLVER");
+        bool         want_lua   = lua_plugins || (env && atoi(env) != 0);
+        if (want_lua) {
         ace_ensure_plugins();
         solver_plugin = PluginRegistry::instance().solver_lookup(solver_name);
         if (!solver_plugin) {
@@ -349,6 +354,7 @@ static int dit_ggml_generate(DiTGGML *           model,
                     solver_plugin->display_name.c_str(), solver_plugin->name.c_str(),
                     solver_plugin->nfe, solver_plugin->order);
         }
+        }  // if (want_lua)
     }
     if (!use_lua_solver) {
         fprintf(stderr, "[DiT] Solver: %s (%d NFE/step, order %d)\n", solver_info->display_name, solver_info->nfe,
@@ -363,20 +369,24 @@ static int dit_ggml_generate(DiTGGML *           model,
     // routes back through the native apg_forward(), so results stay identical.
     LuaPlugin *  guidance_plugin = nullptr;
     bool         use_lua_guidance = false;
-    const char * guidance_mode    = "apg";
-    if (const char * env = getenv("ACE_LUA_GUIDANCE"); env && atoi(env) != 0) {
-        ace_ensure_plugins();
-        guidance_plugin = PluginRegistry::instance().guidance_lookup(guidance_mode);
-        if (!guidance_plugin) {
-            fprintf(stderr, "[DiT] WARNING: Lua guidance '%s' not found, using native APG\n", guidance_mode);
-        } else if (guidance_plugin->has_post_step) {
-            fprintf(stderr, "[DiT] WARNING: guidance '%s' needs post_step (later phase), using native APG\n",
-                    guidance_mode);
-            guidance_plugin = nullptr;
-        } else {
-            use_lua_guidance = true;
-            fprintf(stderr, "[DiT] Guidance (Lua): %s (%s)\n", guidance_plugin->display_name.c_str(),
-                    guidance_plugin->name.c_str());
+    const char * guidance_mode    = (guidance_mode_in && guidance_mode_in[0]) ? guidance_mode_in : "apg";
+    {
+        const char * env      = getenv("ACE_LUA_GUIDANCE");
+        bool         want_lua = lua_plugins || (env && atoi(env) != 0);
+        if (want_lua) {
+            ace_ensure_plugins();
+            guidance_plugin = PluginRegistry::instance().guidance_lookup(guidance_mode);
+            if (!guidance_plugin) {
+                fprintf(stderr, "[DiT] WARNING: Lua guidance '%s' not found, using native APG\n", guidance_mode);
+            } else if (guidance_plugin->has_post_step) {
+                fprintf(stderr, "[DiT] WARNING: guidance '%s' needs post_step (later phase), using native APG\n",
+                        guidance_mode);
+                guidance_plugin = nullptr;
+            } else {
+                use_lua_guidance = true;
+                fprintf(stderr, "[DiT] Guidance (Lua): %s (%s)\n", guidance_plugin->display_name.c_str(),
+                        guidance_plugin->name.c_str());
+            }
         }
     }
 

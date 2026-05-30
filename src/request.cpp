@@ -52,6 +52,9 @@ void request_init(AceRequest * r) {
     r->track                = "";
     r->solver               = SOLVER_EULER;
     r->stork_substeps       = STORK_SUBSTEPS_DEFAULT;
+    r->lua_plugins          = false;
+    r->scheduler            = "";
+    r->guidance_mode        = "";
     r->lm_mode              = LM_MODE_NAME_GENERATE;
     r->output_format        = OUTPUT_FORMAT_MP3;
     r->synth_model          = "";
@@ -105,6 +108,15 @@ static void request_parse_obj(yyjson_val * obj, AceRequest * r) {
     }
     if ((v = yyjson_obj_get(obj, "stork_substeps")) && yyjson_is_int(v)) {
         r->stork_substeps = (int) yyjson_get_int(v);
+    }
+    if ((v = yyjson_obj_get(obj, "lua_plugins")) && yyjson_is_bool(v)) {
+        r->lua_plugins = yyjson_get_bool(v);
+    }
+    if ((v = yyjson_obj_get(obj, "scheduler")) && yyjson_is_str(v)) {
+        r->scheduler = yy_str(v);
+    }
+    if ((v = yyjson_obj_get(obj, "guidance_mode")) && yyjson_is_str(v)) {
+        r->guidance_mode = yy_str(v);
     }
     if ((v = yyjson_obj_get(obj, "custom_timesteps")) && yyjson_is_str(v)) {
         r->custom_timesteps = yy_str(v);
@@ -408,6 +420,15 @@ static yyjson_mut_doc * request_build_doc(const AceRequest * r, bool sparse) {
     yyjson_mut_obj_add_str(doc, root, "solver", r->solver.c_str());
     if (all || r->stork_substeps != def.stork_substeps) {
         yyjson_mut_obj_add_int(doc, root, "stork_substeps", r->stork_substeps);
+    }
+    if (all || r->lua_plugins != def.lua_plugins) {
+        yyjson_mut_obj_add_bool(doc, root, "lua_plugins", r->lua_plugins);
+    }
+    if (all || r->scheduler != def.scheduler) {
+        yyjson_mut_obj_add_str(doc, root, "scheduler", r->scheduler.c_str());
+    }
+    if (all || r->guidance_mode != def.guidance_mode) {
+        yyjson_mut_obj_add_str(doc, root, "guidance_mode", r->guidance_mode.c_str());
     }
     // lm_mode and output_format follow the same rule: enumerations with a
     // guaranteed non-empty value, always explicit in serialized output.
